@@ -234,7 +234,7 @@ fn draw_glyph(
         }
     }
 }
-
+/// scale is a scalar value that multiplies the 8x8 font by that so 3 = 24px
 fn create_atlas(scale: usize) -> FontAtlas {
     const COLS: usize = 16;
     const ROWS: usize = 8;
@@ -575,7 +575,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         gl.delete_shader(text_vshad);
         gl.delete_shader(text_fshad);
 
-        let atlas = create_atlas(9);
+        const SCALE: usize = 9;
+        let atlas = create_atlas(SCALE);
         let atlas_text = gl.create_texture()?;
         gl.bind_texture(glow::TEXTURE_2D, Some(atlas_text));
         gl.tex_image_2d(
@@ -611,18 +612,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         //  // construct the vertices from the
-        let display_text: Vec<char> = "Hello World!".chars().collect();
+        let display_text: Vec<char> = "Welcome back cuz\nEnter your password".chars().collect();
         let mut text_verts: Vec<f32> = Vec::with_capacity(display_text.len() * 6 * 4);
-        let mut cursor = 0;
+        const LINE_HEIGHT: usize = SCALE * 8 + 20;
+        let mut cursor_x = 0;
+        let mut cursor_y = 0;
         let mut width = 0;
         let mut height = 0;
         for c in display_text.iter() {
+            if *c == '\n' {
+                cursor_x = 0;
+                cursor_y += LINE_HEIGHT as usize;
+                continue;
+            }
+
             let glyph = atlas.get_glyph(*c).expect("UNRENDERABLE CHAR");
-            let x0 = cursor as f32;
-            let x1 = (cursor + glyph.w) as f32;
-            let y0 = 0.0;
-            let y1 = glyph.h as f32;
-            width = x1 as u32;
+            let x0 = cursor_x as f32;
+            let x1 = (cursor_x + glyph.w) as f32;
+            let y0 = cursor_y as f32;
+            let y1 = (cursor_y + glyph.h) as f32;
+            width = width.max(x1 as u32);
             height = y1 as u32;
 
             #[rustfmt::skip]
@@ -635,7 +644,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                   x1, y1, glyph.u1, glyph.v1,
                   x0, y1, glyph.u0, glyph.v1,
               ]);
-            cursor += glyph.advance_x;
+            cursor_x += glyph.advance_x;
         }
         let text_verts_bytes = std::slice::from_raw_parts(
             text_verts.as_ptr() as *const u8,
