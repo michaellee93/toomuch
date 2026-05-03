@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs::OpenOptions;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -11,6 +12,92 @@ use font8x8::legacy::BASIC_LEGACY;
 use gbm::{AsRaw, BufferObject, BufferObjectFlags, Device as GbmDevice, Format};
 use glow::{COLOR_BUFFER_BIT, HasContext};
 use khronos_egl as egl;
+
+const BG_VSHAD: &str = "attribute vec2 a_pos; \
+    attribute vec2 a_uv; \
+    varying vec2 v_uv; \
+    void main() { \
+        gl_Position = vec4(a_pos, 0.0, 1.0); \
+        v_uv = a_uv; \
+    }";
+
+//gl_FragColor = vec4(0.117647, 0.117647, 0.180392 + ((v_uv.x + u_time) / 10000.0) , 1.0); \
+//gl_FragColor = vec4(v_uv, 0.4 + sin(u_time), 1.0);
+const BG_FSHAD: &str = "precision mediump float; \
+    varying vec2 v_uv; \
+    uniform float u_time; \
+    void main() { \
+        gl_FragColor = vec4(0.117647, 0.117647, 0.180392 + ((v_uv.x + u_time) / 10000.0) , 1.0); \
+    }";
+const TEXT_VSHAD: &str = "precision mediump float; \
+    attribute vec2 a_pos; \
+    attribute vec2 a_uv; \
+    varying vec2 v_uv; \
+    uniform vec2 u_resolution; \
+    uniform vec2 u_translate; \
+    void main() { \
+        vec2 clip = vec2( \
+            (u_translate.x + a_pos.x) / u_resolution.x * 2.0 - 1.0, \
+            (u_translate.y + 1.0 - a_pos.y) / u_resolution.y * 2.0 \
+        ); \
+        gl_Position = vec4(clip, 0.0, 1.0); \
+        v_uv = a_uv; \
+    } \
+";
+const TEXT_FSHAD: &str = "precision mediump float; \
+    uniform sampler2D u_font; \
+    uniform vec4 u_color; \
+    varying vec2 v_uv; \
+    void main() { \
+       float alpha = texture2D(u_font, v_uv).a; \
+       gl_FragColor = vec4(u_color.rgb, u_color.a * alpha); \
+    } \
+";
+const POST_VSHAD: &str = "attribute vec2 a_pos; attribute vec2 a_uv; varying vec2 v_uv; \
+             void main() { gl_Position = vec4(a_pos, 0.0, 1.0); v_uv = a_uv; }";
+const POST_FSHAD: &str = "precision mediump float; \
+             uniform sampler2D u_tex; \
+             uniform float u_time; \
+             uniform float u_aspect; \
+             uniform vec2 u_resolution; \
+             varying vec2 v_uv; \
+             void main() { \
+                 vec2 centered = v_uv * 2.0 - 1.0; \
+                 centered.x *= u_aspect; \
+                 float r2 = dot(centered, centered); \
+	                 vec2 curved = centered * (1.0 + 0.018 * r2); \
+	                 curved.x /= u_aspect; \
+	                 vec2 uv = curved * 0.5 + 0.5; \
+	                 vec2 feather = 4.0 / u_resolution; \
+	                 vec2 edge = smoothstep(vec2(0.0), feather, uv) * smoothstep(vec2(0.0), feather, 1.0 - uv); \
+	                 float screen_mask = edge.x * edge.y; \
+	                 uv = clamp(uv, vec2(0.0), vec2(1.0)); \
+	                 float burst = pow(max(0.0, sin(u_time * 0.7 + sin(u_time * 0.19) * 2.4)), 18.0); \
+	                 uv.x += sin(uv.y * 42.0 + u_time * 18.0) * 0.0025 * burst; \
+	                 uv = clamp(uv, vec2(0.0), vec2(1.0)); \
+                 vec2 px = 1.0 / u_resolution; \
+                 float aberration = 0.0007 + 0.0012 * r2; \
+                 float red = texture2D(u_tex, uv + vec2(aberration, 0.0)).r; \
+                 float green = texture2D(u_tex, uv).g; \
+                 float blue = texture2D(u_tex, uv - vec2(aberration, 0.0)).b; \
+                 vec4 base = vec4(red, green, blue, 1.0); \
+                 vec3 glow = texture2D(u_tex, uv + vec2(px.x * 2.0, 0.0)).rgb; \
+                 glow += texture2D(u_tex, uv - vec2(px.x * 2.0, 0.0)).rgb; \
+                 glow += texture2D(u_tex, uv + vec2(0.0, px.y * 2.0)).rgb; \
+                 glow += texture2D(u_tex, uv - vec2(0.0, px.y * 2.0)).rgb; \
+                 glow *= 0.25; \
+                 float scanline = 0.965 + 0.035 * sin(uv.y * u_resolution.y * 3.14159); \
+                 float vignette = smoothstep(1.18, 0.35, length(centered)); \
+                 float luma = dot(base.rgb, vec3(0.299, 0.587, 0.114)); \
+                 float white_variation = 1.0 + 0.045 * sin(u_time * 1.7 + uv.y * 17.0 + uv.x * 5.0); \
+                 vec3 color = base.rgb + glow * 0.22; \
+                 color *= mix(1.0, white_variation, smoothstep(0.45, 0.85, luma)); \
+	                 color *= scanline; \
+	                 color *= 0.88 + 0.12 * vignette; \
+	                 color += vec3(0.02, 0.025, 0.04) * burst; \
+	                 color = mix(vec3(0.03, 0.028, 0.04), color, screen_mask); \
+	                 gl_FragColor = vec4(color, 1.0); \
+	             }";
 
 // ---------------------------------------------------------------------------
 // DRM device wrapper
@@ -95,7 +182,110 @@ fn text_to_rgba(text: &str, scale: usize, w: usize, h: usize, bg: [u8; 4], fg: [
     buf
 }
 
-fn create_atlas() {}
+struct FontAtlas {
+    rgba: Vec<u8>,
+    w: usize, // pixels
+    h: usize, // pixels
+    glyph_map: HashMap<char, Glyph>,
+}
+
+impl FontAtlas {
+    fn get_glyph(&self, c: char) -> Option<&Glyph> {
+        self.glyph_map.get(&c)
+    }
+}
+
+struct Glyph {
+    w: usize,
+    h: usize,
+    advance_x: usize,
+    u0: f32,
+    u1: f32,
+    v0: f32,
+    v1: f32,
+}
+
+fn draw_glyph(
+    buf: &mut [u8],
+    buf_w: usize,
+    buf_h: usize,
+    glyph: [u8; 8],
+    x: usize,
+    y: usize,
+    scale: usize,
+    color: [u8; 4],
+) {
+    for (row, &byte) in glyph.iter().enumerate() {
+        for col in 0..8usize {
+            if (byte >> col) & 1 == 0 {
+                continue;
+            }
+
+            for sy in 0..scale {
+                for sx in 0..scale {
+                    let px = x + col * scale + sx;
+                    let py = y + row * scale + sy;
+                    if px < buf_w && py < buf_h {
+                        let idx = (py * buf_w + px) * 4;
+                        buf[idx..idx + 4].copy_from_slice(&color);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn create_atlas(scale: usize) -> FontAtlas {
+    const COLS: usize = 16;
+    const ROWS: usize = 8;
+    const GLYPH_SIZE: usize = 8;
+    const FG: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
+
+    let cell = GLYPH_SIZE * scale;
+    let w = COLS * cell;
+    let h = ROWS * cell;
+    let mut rgba = vec![0u8; w * h * 4];
+    let mut glyph_map = HashMap::new();
+
+    for code in 0u8..=127 {
+        let ch = code as char;
+        let atlas_col = code as usize % COLS;
+        let atlas_row = code as usize / COLS;
+        let x = atlas_col * cell;
+        let y = atlas_row * cell;
+
+        draw_glyph(
+            &mut rgba,
+            w,
+            h,
+            BASIC_LEGACY[code as usize],
+            x,
+            y,
+            scale,
+            FG,
+        );
+
+        glyph_map.insert(
+            ch,
+            Glyph {
+                w: cell,
+                h: cell,
+                advance_x: cell,
+                u0: x as f32 / w as f32,
+                u1: (x + cell) as f32 / w as f32,
+                v0: y as f32 / h as f32,
+                v1: (y + cell) as f32 / h as f32,
+            },
+        );
+    }
+
+    FontAtlas {
+        rgba,
+        w,
+        h,
+        glyph_map,
+    }
+}
 
 fn framebuffer_depth(format: Format) -> u32 {
     match format {
@@ -117,6 +307,47 @@ fn wait_for_page_flip(
             }
         }
     }
+}
+
+unsafe fn compile_shader(
+    gl: &glow::Context,
+    kind: u32,
+    source: &str,
+) -> Result<glow::Shader, Box<dyn std::error::Error>> {
+    let shader = unsafe { gl.create_shader(kind)? };
+    unsafe {
+        gl.shader_source(shader, source);
+        gl.compile_shader(shader);
+    }
+
+    if unsafe { !gl.get_shader_compile_status(shader) } {
+        let log = unsafe { gl.get_shader_info_log(shader) };
+        unsafe { gl.delete_shader(shader) };
+        return Err(format!("shader compile failed:\n{log}").into());
+    }
+
+    Ok(shader)
+}
+
+unsafe fn link_program(
+    gl: &glow::Context,
+    vs: glow::Shader,
+    fs: glow::Shader,
+) -> Result<glow::Program, Box<dyn std::error::Error>> {
+    let program = unsafe { gl.create_program()? };
+    unsafe {
+        gl.attach_shader(program, vs);
+        gl.attach_shader(program, fs);
+        gl.link_program(program);
+    }
+
+    if unsafe { !gl.get_program_link_status(program) } {
+        let log = unsafe { gl.get_program_info_log(program) };
+        unsafe { gl.delete_program(program) };
+        return Err(format!("program link failed:\n{log}").into());
+    }
+
+    Ok(program)
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +472,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .make_current(disp, Some(surf), Some(surf), Some(ctx))
         .map_err(|e| format!("eglMakeCurrent: {e}"))?;
     eprintln!("egl make_current ok");
-
     // --- OpenGL ES ---
     let gl = unsafe {
         glow::Context::from_loader_function(|s| {
@@ -253,12 +483,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let (prog, time_loc) = unsafe {
-        // Upload texture (full-framebuffer RGBA image with text pre-rendered).
-        const BG: [u8; 4] = [0x1e, 0x1e, 0x2e, 0xff]; // catppuccin base
-        const FG: [u8; 4] = [0xcd, 0xd6, 0xf4, 0xff]; // catppuccin text
-        let pixels = text_to_rgba("Hello, world!", 4, w as usize, h as usize, BG, FG);
-        let tex = gl.create_texture()?;
-        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        // Fullscreen quad. Keep V in the same top-to-bottom order as the
+        // generated pixel buffer; this matches the GBM/KMS scanout path here.
+        #[rustfmt::skip]
+        let verts: [f32; 16] = [
+            -1.0,  1.0,  0.0, 1.0,
+             1.0,  1.0,  1.0, 1.0,
+            -1.0, -1.0,  0.0, 0.0,
+             1.0, -1.0,  1.0, 0.0,
+        ];
+        let verts_bytes = std::slice::from_raw_parts(
+            verts.as_ptr() as *const u8,
+            verts.len() * std::mem::size_of::<f32>(),
+        );
+        let vbo = gl.create_buffer()?;
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, verts_bytes, glow::STATIC_DRAW);
+
+        // construct fb on the gpu now
+        let scene_tex = gl.create_texture()?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(scene_tex));
         gl.tex_image_2d(
             glow::TEXTURE_2D,
             0,
@@ -268,7 +512,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             0,
             glow::RGBA,
             glow::UNSIGNED_BYTE,
-            Some(&pixels),
+            None,
         );
         gl.tex_parameter_i32(
             glow::TEXTURE_2D,
@@ -291,86 +535,210 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             glow::CLAMP_TO_EDGE as i32,
         );
 
+        let scene_fbo = gl.create_framebuffer()?;
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(scene_fbo));
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(scene_tex),
+            0,
+        );
+        let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+        assert_eq!(status, glow::FRAMEBUFFER_COMPLETE);
+
+        let scene_vshad = compile_shader(&gl, glow::VERTEX_SHADER, BG_VSHAD)?;
+        let scene_fshad = compile_shader(&gl, glow::FRAGMENT_SHADER, BG_FSHAD)?;
+        let scene_program = link_program(&gl, scene_vshad, scene_fshad)?;
+        gl.delete_shader(scene_vshad);
+        gl.delete_shader(scene_fshad);
+
+        let scene_pos = gl
+            .get_attrib_location(scene_program, "a_pos")
+            .expect("a_pos");
+        let scene_uv = gl.get_attrib_location(scene_program, "a_uv").expect("a_uv");
+        gl.enable_vertex_attrib_array(scene_pos);
+        gl.vertex_attrib_pointer_f32(scene_pos, 2, glow::FLOAT, false, 16, 0);
+        gl.enable_vertex_attrib_array(scene_uv);
+        gl.vertex_attrib_pointer_f32(scene_uv, 2, glow::FLOAT, false, 16, 8);
+
+        // draw the base scene
+        gl.viewport(0, 0, w as i32, h as i32);
+        gl.use_program(Some(scene_program));
+        gl.clear(COLOR_BUFFER_BIT);
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+
+        // create text rendering prog
+        let text_vshad = compile_shader(&gl, glow::VERTEX_SHADER, TEXT_VSHAD)?;
+        let text_fshad = compile_shader(&gl, glow::FRAGMENT_SHADER, TEXT_FSHAD)?;
+        let text_program = link_program(&gl, text_vshad, text_fshad)?;
+        gl.delete_shader(text_vshad);
+        gl.delete_shader(text_fshad);
+
+        let atlas = create_atlas(9);
+        let atlas_text = gl.create_texture()?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(atlas_text));
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::RGBA as i32,
+            atlas.w as i32,
+            atlas.h as i32,
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            Some(&atlas.rgba),
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MIN_FILTER,
+            glow::NEAREST as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MAG_FILTER,
+            glow::NEAREST as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_S,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_T,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+
+        //  // construct the vertices from the
+        let display_text: Vec<char> = "Hello World!".chars().collect();
+        let mut text_verts: Vec<f32> = Vec::with_capacity(display_text.len() * 6 * 4);
+        let mut cursor = 0;
+        let mut width = 0;
+        let mut height = 0;
+        for c in display_text.iter() {
+            let glyph = atlas.get_glyph(*c).expect("UNRENDERABLE CHAR");
+            let x0 = cursor as f32;
+            let x1 = (cursor + glyph.w) as f32;
+            let y0 = 0.0;
+            let y1 = glyph.h as f32;
+            width = x1 as u32;
+            height = y1 as u32;
+
+            #[rustfmt::skip]
+              text_verts.extend_from_slice(&[
+                  x0, y0, glyph.u0, glyph.v0,
+                  x1, y0, glyph.u1, glyph.v0,
+                  x0, y1, glyph.u0, glyph.v1,
+
+                  x1, y0, glyph.u1, glyph.v0,
+                  x1, y1, glyph.u1, glyph.v1,
+                  x0, y1, glyph.u0, glyph.v1,
+              ]);
+            cursor += glyph.advance_x;
+        }
+        let text_verts_bytes = std::slice::from_raw_parts(
+            text_verts.as_ptr() as *const u8,
+            text_verts.len() * std::mem::size_of::<f32>(),
+        );
+        let text_vbo = gl.create_buffer()?;
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(text_vbo));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, text_verts_bytes, glow::STATIC_DRAW);
+
+        gl.use_program(Some(text_program));
+        //  // attr4ibuts
+        let text_pos = gl
+            .get_attrib_location(text_program, "a_pos")
+            .expect("a_pos");
+        let text_uv = gl.get_attrib_location(text_program, "a_uv").expect("a_uv");
+        gl.enable_vertex_attrib_array(text_pos);
+        gl.vertex_attrib_pointer_f32(text_pos, 2, glow::FLOAT, false, 16, 0);
+        gl.enable_vertex_attrib_array(text_uv);
+        gl.vertex_attrib_pointer_f32(text_uv, 2, glow::FLOAT, false, 16, 8);
+
+        //  // resolution
+        let text_res_loc = gl
+            .get_uniform_location(text_program, "u_resolution")
+            .expect("couldn't get uniform");
+        let text_font_loc = gl
+            .get_uniform_location(text_program, "u_font")
+            .expect("u_font");
+        let text_color_loc = gl
+            .get_uniform_location(text_program, "u_color")
+            .expect("u_color");
+        let text_translate_loc = gl
+            .get_uniform_location(text_program, "u_translate")
+            .expect("u_translate");
+
+        gl.uniform_2_f32(
+            Some(&text_translate_loc),
+            ((w - width) / 2) as f32,
+            height as f32 / 2.0,
+        );
+
+        gl.uniform_2_f32(Some(&text_res_loc), w as f32, h as f32);
+
+        gl.viewport(0, 0, w as i32, h as i32);
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(atlas_text));
+        gl.uniform_1_i32(Some(&text_font_loc), 0);
+        gl.uniform_4_f32(Some(&text_color_loc), 0.8039216, 0.8392157, 0.95686275, 1.0);
+        gl.enable(glow::BLEND);
+        gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+        gl.draw_arrays(glow::TRIANGLES, 0, (text_verts.len() / 4) as i32);
+        gl.disable(glow::BLEND);
+
+        // Upload texture (full-framebuffer RGBA image with text pre-rendered).
+        //        const BG: [u8; 4] = [0x1e, 0x1e, 0x2e, 0xff]; // catppuccin base
+        //        const FG: [u8; 4] = [0xcd, 0xd6, 0xf4, 0xff]; // catppuccin text
+        //        let pixels = text_to_rgba("Hello, world!", 4, w as usize, h as usize, BG, FG);
+        //        let tex = gl.create_texture()?;
+        //        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        //        gl.tex_image_2d(
+        //            glow::TEXTURE_2D,
+        //            0,
+        //            glow::RGBA as i32,
+        //            w as i32,
+        //            h as i32,
+        //            0,
+        //            glow::RGBA,
+        //            glow::UNSIGNED_BYTE,
+        //            Some(&pixels),
+        //        );
+        //        gl.tex_parameter_i32(
+        //            glow::TEXTURE_2D,
+        //            glow::TEXTURE_MIN_FILTER,
+        //            glow::NEAREST as i32,
+        //        );
+        //        gl.tex_parameter_i32(
+        //            glow::TEXTURE_2D,
+        //            glow::TEXTURE_MAG_FILTER,
+        //            glow::NEAREST as i32,
+        //        );
+        //        gl.tex_parameter_i32(
+        //            glow::TEXTURE_2D,
+        //            glow::TEXTURE_WRAP_S,
+        //            glow::CLAMP_TO_EDGE as i32,
+        //        );
+        //        gl.tex_parameter_i32(
+        //            glow::TEXTURE_2D,
+        //            glow::TEXTURE_WRAP_T,
+        //            glow::CLAMP_TO_EDGE as i32,
+        //        );
+
+        // restore the fbo to default and bind texture to the scene_tex we rendered into
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(scene_tex));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+
         // Minimal GLSL ES shader: fullscreen textured quad.
-        let vs = gl.create_shader(glow::VERTEX_SHADER)?;
-        gl.shader_source(
-            vs,
-            "attribute vec2 a_pos; attribute vec2 a_uv; varying vec2 v_uv; \
-             void main() { gl_Position = vec4(a_pos, 0.0, 1.0); v_uv = a_uv; }",
-        );
-        gl.compile_shader(vs);
-
-        let fs = gl.create_shader(glow::FRAGMENT_SHADER)?;
-        gl.shader_source(
-            fs,
-             "precision mediump float; \
-             uniform sampler2D u_tex; \
-             uniform float u_time; \
-             uniform float u_aspect; \
-             uniform vec2 u_resolution; \
-             varying vec2 v_uv; \
-             void main() { \
-                 vec2 centered = v_uv * 2.0 - 1.0; \
-                 centered.x *= u_aspect; \
-                 float r2 = dot(centered, centered); \
-                 vec2 curved = centered * (1.0 + 0.018 * r2); \
-                 curved.x /= u_aspect; \
-                 vec2 uv = curved * 0.5 + 0.5; \
-                 if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { \
-                     gl_FragColor = vec4(0.03, 0.028, 0.04, 1.0); \
-                     return; \
-                 } \
-                 float burst = pow(max(0.0, sin(u_time * 0.7 + sin(u_time * 0.19) * 2.4)), 18.0); \
-                 uv.x += sin(uv.y * 42.0 + u_time * 18.0) * 0.0025 * burst; \
-                 vec2 px = 1.0 / u_resolution; \
-                 float aberration = 0.0007 + 0.0012 * r2; \
-                 float red = texture2D(u_tex, uv + vec2(aberration, 0.0)).r; \
-                 float green = texture2D(u_tex, uv).g; \
-                 float blue = texture2D(u_tex, uv - vec2(aberration, 0.0)).b; \
-                 vec4 base = vec4(red, green, blue, 1.0); \
-                 vec3 glow = texture2D(u_tex, uv + vec2(px.x * 2.0, 0.0)).rgb; \
-                 glow += texture2D(u_tex, uv - vec2(px.x * 2.0, 0.0)).rgb; \
-                 glow += texture2D(u_tex, uv + vec2(0.0, px.y * 2.0)).rgb; \
-                 glow += texture2D(u_tex, uv - vec2(0.0, px.y * 2.0)).rgb; \
-                 glow *= 0.25; \
-                 float scanline = 0.965 + 0.035 * sin(uv.y * u_resolution.y * 3.14159); \
-                 float vignette = smoothstep(1.18, 0.35, length(centered)); \
-                 float luma = dot(base.rgb, vec3(0.299, 0.587, 0.114)); \
-                 float white_variation = 1.0 + 0.045 * sin(u_time * 1.7 + uv.y * 17.0 + uv.x * 5.0); \
-                 vec3 color = base.rgb + glow * 0.22; \
-                 color *= mix(1.0, white_variation, smoothstep(0.45, 0.85, luma)); \
-                 color *= scanline; \
-                 color *= 0.88 + 0.12 * vignette; \
-                 color += vec3(0.02, 0.025, 0.04) * burst; \
-                 gl_FragColor = vec4(color, 1.0); \
-             }",
-        );
-        gl.compile_shader(fs);
-
-        let prog = gl.create_program()?;
-        gl.attach_shader(prog, vs);
-        gl.attach_shader(prog, fs);
-        gl.link_program(prog);
+        let vs = compile_shader(&gl, glow::VERTEX_SHADER, POST_VSHAD)?;
+        let fs = compile_shader(&gl, glow::FRAGMENT_SHADER, POST_FSHAD)?;
+        let prog = link_program(&gl, vs, fs)?;
         gl.use_program(Some(prog));
         gl.delete_shader(vs);
         gl.delete_shader(fs);
-
-        // Fullscreen quad. Keep V in the same top-to-bottom order as the
-        // generated pixel buffer; this matches the GBM/KMS scanout path here.
-        #[rustfmt::skip]
-        let verts: [f32; 16] = [
-            -1.0,  1.0,  0.0, 0.0,
-             1.0,  1.0,  1.0, 0.0,
-            -1.0, -1.0,  0.0, 1.0,
-             1.0, -1.0,  1.0, 1.0,
-        ];
-        let verts_bytes = std::slice::from_raw_parts(
-            verts.as_ptr() as *const u8,
-            verts.len() * std::mem::size_of::<f32>(),
-        );
-        let vbo = gl.create_buffer()?;
-        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, verts_bytes, glow::STATIC_DRAW);
 
         let pos = gl.get_attrib_location(prog, "a_pos").expect("a_pos");
         let uv = gl.get_attrib_location(prog, "a_uv").expect("a_uv");
