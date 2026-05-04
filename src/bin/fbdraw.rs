@@ -1,17 +1,17 @@
-use std::collections::HashMap;
-use std::convert::TryFrom;
-use std::fs::OpenOptions;
-use std::os::fd::{AsFd, BorrowedFd};
-use std::time::Instant;
-
 use drm::Device as DrmDevice;
 use drm::control::{
     Device as ControlDevice, Event, Mode, PageFlipFlags, connector, crtc, framebuffer,
 };
+use evdev::Device as EvDevice;
 use font8x8::legacy::BASIC_LEGACY;
 use gbm::{AsRaw, BufferObject, BufferObjectFlags, Device as GbmDevice, Format};
 use glow::{COLOR_BUFFER_BIT, HasContext, NativeBuffer, NativeProgram, NativeTexture};
 use khronos_egl as egl;
+use std::collections::HashMap;
+use std::convert::TryFrom;
+use std::fs::{self, OpenOptions};
+use std::os::fd::{AsFd, BorrowedFd};
+use std::time::Instant;
 
 const BG_VSHAD: &str = "attribute vec2 a_pos; \
     attribute vec2 a_uv; \
@@ -107,6 +107,56 @@ const POST_FSHAD: &str = "precision mediump float; \
 	                 color = mix(vec3(0.03, 0.028, 0.04), color, screen_mask); \
 	                 gl_FragColor = vec4(color, 1.0); \
 	             }";
+
+use evdev::{EventType, Key};
+
+// Keyboard stuff
+fn find_keyboard() -> std::io::Result<EvDevice> {
+    for entry in fs::read_dir("/dev/input")? {
+        let path = entry?.path();
+
+        if !path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("event"))
+        {
+            continue;
+        }
+
+        let dev = EvDevice::open(&path)?;
+
+        if dev
+            .supported_keys()
+            .is_some_and(|keys| keys.contains(Key::KEY_A) && keys.contains(Key::KEY_ENTER))
+        {
+            eprintln!("keyboard: {:?}", path);
+            return Ok(dev);
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no keyboard found",
+    ))
+}
+
+use std::os::fd::AsRawFd;
+
+fn set_evdev_nonblocking(dev: &evdev::Device) -> std::io::Result<()> {
+    let fd = dev.as_raw_fd();
+
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // DRM device wrapper
@@ -364,6 +414,10 @@ unsafe fn link_program(
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut keyboard = find_keyboard()?;
+    set_evdev_nonblocking(&keyboard)?;
+    let mut input = String::new();
+
     // --- DRM / GBM ---
     let card = Card(
         OpenOptions::new()
@@ -502,9 +556,123 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("displaying animated shader — Ctrl-C to exit");
     loop {
+        match keyboard.fetch_events() {
+            Ok(events) => {
+                for ev in events {
+                    if ev.event_type() != EventType::KEY {
+                        continue;
+                    }
+                    let press_or_hold = ev.value() == 2 || ev.value() == 1;
+
+                    let key = Key(ev.code());
+                    match (key, press_or_hold) {
+                        (Key::KEY_M, true) => {
+                            input.push('m');
+                        }
+                        (Key::KEY_I, true) => {
+                            input.push('i');
+                        }
+                        (Key::KEY_C, true) => {
+                            input.push('c');
+                        }
+                        (Key::KEY_H, true) => {
+                            input.push('h');
+                        }
+                        (Key::KEY_A, true) => {
+                            input.push('a');
+                        }
+                        (Key::KEY_E, true) => {
+                            input.push('e');
+                        }
+                        (Key::KEY_L, true) => {
+                            input.push('l');
+                        }
+                        (Key::KEY_B, true) => {
+                            input.push('b');
+                        }
+                        (Key::KEY_D, true) => {
+                            input.push('d');
+                        }
+                        (Key::KEY_F, true) => {
+                            input.push('f');
+                        }
+                        (Key::KEY_G, true) => {
+                            input.push('g');
+                        }
+                        (Key::KEY_J, true) => {
+                            input.push('j');
+                        }
+                        (Key::KEY_K, true) => {
+                            input.push('k');
+                        }
+                        (Key::KEY_N, true) => {
+                            input.push('n');
+                        }
+                        (Key::KEY_O, true) => {
+                            input.push('o');
+                        }
+                        (Key::KEY_P, true) => {
+                            input.push('p');
+                        }
+                        (Key::KEY_Q, true) => {
+                            input.push('q');
+                        }
+                        (Key::KEY_R, true) => {
+                            input.push('r');
+                        }
+                        (Key::KEY_S, true) => {
+                            input.push('s');
+                        }
+                        (Key::KEY_T, true) => {
+                            input.push('t');
+                        }
+                        (Key::KEY_U, true) => {
+                            input.push('u');
+                        }
+                        (Key::KEY_V, true) => {
+                            input.push('v');
+                        }
+                        (Key::KEY_W, true) => {
+                            input.push('w');
+                        }
+                        (Key::KEY_X, true) => {
+                            input.push('x');
+                        }
+                        (Key::KEY_Y, true) => {
+                            input.push('y');
+                        }
+                        (Key::KEY_Z, true) => {
+                            input.push('z');
+                        }
+                        (Key::KEY_SPACE, true) => {
+                            input.push(' ');
+                        }
+                        (Key::KEY_ENTER, true) => {
+                            input.push('\n');
+                        }
+                        (Key::KEY_8, true) => {
+                            input.push('*');
+                        }
+                        (Key::KEY_BACKSPACE, true) => {
+                            input.pop();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+
         let t = start.elapsed().as_secs_f32();
         bg_scene.draw(&gl);
-        text_scene.draw(&gl, bg_scene.scene_fbo, "Hello _", w, h, t)?;
+        text_scene.draw(
+            &gl,
+            bg_scene.scene_fbo,
+            &format!("Hello {}_", input),
+            w,
+            h,
+            t,
+        )?;
         post_scene.draw(&gl, bg_scene.scene_tex, w as f32, h as f32, t)?;
 
         egl_api
@@ -837,7 +1005,7 @@ impl TextScene {
 
             gl.uniform_2_f32(
                 Some(&self.text_translate_loc),
-                ((w - width) / 2) as f32,
+                (w.saturating_sub(width) / 2) as f32,
                 height as f32 / 2.0,
             );
 
