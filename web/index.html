@@ -172,8 +172,17 @@
       const defaultBgShader = `precision mediump float;
 varying vec2 v_uv;
 uniform float u_time;
+
 void main() {
-  gl_FragColor = vec4(0.117647, 0.117647, 0.180392 + ((v_uv.x + u_time) / 10000.0), 1.0);
+  float t = u_time * 0.08;
+  float a = sin(v_uv.y * 3.1 + t) * sin(v_uv.x * 2.3 - t * 0.6);
+  float b = sin(v_uv.y * 5.7 - t * 1.1) * sin(v_uv.x * 1.9 + t * 0.4);
+  vec3 col = vec3(0.06, 0.06, 0.10);
+  col += vec3(0.04, 0.01, 0.06) * (0.5 + 0.5 * a);
+  col += vec3(0.01, 0.02, 0.04) * (0.5 + 0.5 * b);
+  float d = length(v_uv - 0.5);
+  col *= 1.1 - d * 0.9;
+  gl_FragColor = vec4(col, 1.0);
 }`;
 
       const defaultEffectShader = `precision highp float;
@@ -198,17 +207,48 @@ uniform int u_login_state;
 uniform float u_state_time;
 varying vec2 v_uv;
 
+float hash(vec2 p) {
+  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+
 void main() {
   vec2 uv = v_uv;
   vec2 px = 1.0 / u_resolution;
-  float wave = sin(uv.y * 80.0 + u_time * 8.0) * 0.0015;
+
+  // subtle horizontal wave
+  uv.x += sin(uv.y * 60.0 + u_time * 6.0) * 0.0008;
+
+  // chromatic aberration
+  float ca = 0.0008;
+  float r = texture2D(u_tex, uv + vec2(ca, 0.0)).r;
+  float g = texture2D(u_tex, uv).g;
+  float b = texture2D(u_tex, uv - vec2(ca, 0.0)).b;
+  vec3 col = vec3(r, g, b);
+
+  // soft bloom
+  vec3 bloom = texture2D(u_tex, uv + vec2(px.x * 2.0, 0.0)).rgb;
+  bloom    += texture2D(u_tex, uv - vec2(px.x * 2.0, 0.0)).rgb;
+  bloom    += texture2D(u_tex, uv + vec2(0.0, px.y * 2.0)).rgb;
+  bloom    += texture2D(u_tex, uv - vec2(0.0, px.y * 2.0)).rgb;
+  col += bloom * 0.055;
+
+  // scanlines
+  col *= 0.97 + 0.03 * sin(uv.y * u_resolution.y * 3.14159);
+
+  // vignette
+  vec2 c = uv - 0.5;
+  col *= 1.0 - dot(c, c) * 1.8;
+
+  // film grain
+  col += (hash(uv + fract(u_time * 0.1)) - 0.5) * 0.028;
+
+  // auth failure red flash
   if (u_login_state == 4) {
-    wave += sin(floor(uv.y * 36.0) + u_time * 40.0) * 0.012 * exp(-u_state_time * 2.8);
+    float hit = exp(-u_state_time * 3.0);
+    col = mix(col, col * vec3(1.5, 0.55, 0.55), hit);
   }
-  vec4 color = texture2D(u_tex, uv + vec2(wave, 0.0));
-  color.rgb += texture2D(u_tex, uv + vec2(px.x * 2.0, 0.0)).rgb * 0.08;
-  color.rgb *= 0.94 + 0.06 * sin(uv.y * u_resolution.y * 3.14159);
-  gl_FragColor = color;
+
+  gl_FragColor = vec4(max(col, vec3(0.0)), 1.0);
 }`;
 
       const bgShader = document.getElementById("bg-shader");

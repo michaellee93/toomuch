@@ -70,7 +70,7 @@ impl WebApp {
                     if username == "user" && password == "password" =>
                 {
                     runtime.app.handle_event(LoginEvent::AuthAccepted);
-                    runtime.app.handle_event(LoginEvent::SessionStarted);
+                    //runtime.app.handle_event(LoginEvent::SessionStarted);
                 }
                 Some(LoginAction::Authenticate { .. }) => {
                     runtime.app.handle_event(LoginEvent::AuthFailure);
