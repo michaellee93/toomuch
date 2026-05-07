@@ -8,15 +8,11 @@ crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "toomuch"
-path = "src/main.rs"
+path = "src/bin/toomuch.rs"
 
 [[bin]]
 name = "greet"
 path = "src/bin/greet.rs"
-
-[[bin]]
-name = "fbdraw"
-path = "src/bin/fbdraw.rs"
 
 [dependencies]
 font8x8 = "0.2"
