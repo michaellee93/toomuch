@@ -6,345 +6,22 @@ use drm::buffer::{
 use drm::control::{
     Device as ControlDevice, Event, FbCmd2Flags, Mode, PageFlipFlags, connector, crtc, framebuffer,
 };
-use evdev::Device as EvDevice;
 use font8x8::legacy::BASIC_LEGACY;
 use gbm::{AsRaw, BufferObjectFlags, Device as GbmDevice, Format};
 use glow::{COLOR_BUFFER_BIT, HasContext, NativeBuffer, NativeProgram, NativeTexture};
 use khronos_egl as egl;
-use shlog::{AuthMessageType, Request, Response, recv, send};
+use shlog::greetd_client::{GreetdCommand, GreetdResult, spawn_greetd_worker};
+use shlog::keyboard::{KeyboardInput, find_keyboards, set_evdev_nonblocking};
+use shlog::login::{LoginAction, LoginEvent, LoginState};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::num::NonZeroU32;
 use std::os::fd::{AsFd, BorrowedFd};
-use std::os::unix::net::UnixStream;
 use std::ptr::NonNull;
-use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-
-const BG_VSHAD: &str = "attribute vec2 a_pos; \
-    attribute vec2 a_uv; \
-    varying vec2 v_uv; \
-    void main() { \
-        gl_Position = vec4(a_pos, 0.0, 1.0); \
-        v_uv = a_uv; \
-    }";
-
-//gl_FragColor = vec4(0.117647, 0.117647, 0.180392 + ((v_uv.x + u_time) / 10000.0) , 1.0); \
-//gl_FragColor = vec4(v_uv, 0.4 + sin(u_time), 1.0);
-const BG_FSHAD: &str = "precision mediump float; \
-    varying vec2 v_uv; \
-    uniform float u_time; \
-    void main() { \
-        gl_FragColor = vec4(0.117647, 0.117647, 0.180392 + ((v_uv.x + u_time) / 10000.0) , 1.0); \
-    }";
-const TEXT_VSHAD: &str = "precision mediump float; \
-    attribute vec2 a_pos; \
-    attribute vec2 a_uv; \
-    attribute float a_blink; \
-    varying vec2 v_uv; \
-    varying float v_blink; \
-    uniform vec2 u_resolution; \
-    uniform vec2 u_translate; \
-    void main() { \
-        v_blink = a_blink; \
-        vec2 clip = vec2( \
-            (u_translate.x + a_pos.x) / u_resolution.x * 2.0 - 1.0, \
-            (u_translate.y + 1.0 - a_pos.y) / u_resolution.y * 2.0 \
-        ); \
-        gl_Position = vec4(clip, 0.0, 1.0); \
-        v_uv = a_uv; \
-    } \
-";
-const TEXT_FSHAD: &str = "precision mediump float; \
-    uniform sampler2D u_font; \
-    uniform vec4 u_color; \
-    uniform float u_time; \
-    varying vec2 v_uv; \
-    varying float v_blink; \
-    void main() { \
-       float alpha = texture2D(u_font, v_uv).a; \
-        if (v_blink > 0.0) {
-
-    alpha *= step(0.5, fract(u_time * 1.50));
-    }
-       gl_FragColor = vec4(u_color.rgb, u_color.a * alpha ); \
-    } \
-";
-const POST_VSHAD: &str = "attribute vec2 a_pos; attribute vec2 a_uv; varying vec2 v_uv; \
-             void main() { gl_Position = vec4(a_pos, 0.0, 1.0); v_uv = a_uv; }";
-const POST_FSHAD: &str = "precision highp float; \
-             uniform sampler2D u_tex; \
-	             uniform float u_time; \
-	             uniform float u_aspect; \
-	             uniform vec2 u_resolution; \
-	             uniform int u_login_state; \
-	             uniform float u_state_time; \
-	             varying vec2 v_uv; \
-                 float hash(float n) { n = fract(n * 0.1031); n *= n + 33.33; n *= n + n; return fract(n); } \
-	             void main() { \
-                 vec2 centered = v_uv * 2.0 - 1.0; \
-                 centered.x *= u_aspect; \
-                 float r2 = dot(centered, centered); \
-	                 vec2 curved = centered * (1.0 + 0.018 * r2); \
-	                 curved.x /= u_aspect; \
-	                 vec2 uv = curved * 0.5 + 0.5; \
-	                 vec2 feather = 4.0 / u_resolution; \
-	                 vec2 edge = smoothstep(vec2(0.0), feather, uv) * smoothstep(vec2(0.0), feather, 1.0 - uv); \
-	                 float screen_mask = edge.x * edge.y; \
-	                 uv = clamp(uv, vec2(0.0), vec2(1.0)); \
-	                 float burst = pow(max(0.0, sin(u_time * 0.7 + sin(u_time * 0.19) * 2.4)), 18.0); \
-                         float failure_hit = 0.0; \
-                         if (u_login_state == 4) { failure_hit = exp(-u_state_time * 2.8); } \
-                         float glitch_band = floor(uv.y * 48.0); \
-                         float glitch_tick = mod(floor(u_time * 18.0), 64.0); \
-                         float glitch_gate = step(0.72, hash(glitch_band * 17.0 + glitch_tick)); \
-                         float glitch_offset = (hash(glitch_band * 61.0 + glitch_tick * 7.0) - 0.5) * 0.09 * failure_hit * glitch_gate; \
-		                 uv.x += sin(uv.y * 42.0 + u_time * 18.0) * 0.0025 * burst + glitch_offset; \
-                         uv.x = fract(uv.x); \
-		                 uv = clamp(uv, vec2(0.0), vec2(1.0)); \
-                 vec2 px = 1.0 / u_resolution; \
-                 float aberration = 0.0007 + 0.0012 * r2 + 0.006 * failure_hit; \
-                 float red = texture2D(u_tex, uv + vec2(aberration, 0.0)).r; \
-                 float green = texture2D(u_tex, uv).g; \
-                 float blue = texture2D(u_tex, uv - vec2(aberration, 0.0)).b; \
-                 vec4 base = vec4(red, green, blue, 1.0); \
-                 vec3 glow = texture2D(u_tex, uv + vec2(px.x * 2.0, 0.0)).rgb; \
-                 glow += texture2D(u_tex, uv - vec2(px.x * 2.0, 0.0)).rgb; \
-                 glow += texture2D(u_tex, uv + vec2(0.0, px.y * 2.0)).rgb; \
-                 glow += texture2D(u_tex, uv - vec2(0.0, px.y * 2.0)).rgb; \
-                 glow *= 0.25; \
-                 float scanline = 0.965 + 0.035 * sin(uv.y * u_resolution.y * 3.14159); \
-                 float vignette = smoothstep(1.18, 0.35, length(centered)); \
-                 float luma = dot(base.rgb, vec3(0.299, 0.587, 0.114)); \
-                 float white_variation = 1.0 + 0.045 * sin(u_time * 1.7 + uv.y * 17.0 + uv.x * 5.0); \
-                 vec3 color = base.rgb + glow * 0.22; \
-                 color *= mix(1.0, white_variation, smoothstep(0.45, 0.85, luma)); \
-		                 color *= scanline; \
-		                 color *= 0.88 + 0.12 * vignette; \
-                         color += vec3(0.02, 0.025, 0.04) * burst; \
-                         color = mix(color, vec3(color.r + 0.45, color.g * 0.55, color.b * 0.55), failure_hit); \
-		                 color = mix(vec3(0.03, 0.028, 0.04), color, screen_mask); \
-	                 gl_FragColor = vec4(color, 1.0); \
-	             }";
-
-const DOT_ANIMATION_INTERVAL: Duration = Duration::from_millis(180);
-const DOT_ANIMATION_STEPS: u128 = 4;
-
-use evdev::{EventType, Key};
-
-// Keyboard stuff
-fn find_keyboards() -> std::io::Result<Vec<EvDevice>> {
-    let mut paths = fs::read_dir("/dev/input")?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("event"))
-        })
-        .collect::<Vec<_>>();
-
-    paths.sort();
-
-    let mut keyboards = Vec::new();
-
-    for path in paths {
-        let dev = match EvDevice::open(&path) {
-            Ok(dev) => dev,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                eprintln!("skip input {path:?}: disappeared");
-                continue;
-            }
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                eprintln!("skip input {path:?}: permission denied");
-                continue;
-            }
-            Err(e) => {
-                eprintln!("skip input {path:?}: {e}");
-                continue;
-            }
-        };
-
-        if dev.supported_keys().is_some_and(|keys| {
-            keys.contains(Key::KEY_A)
-                && keys.contains(Key::KEY_Z)
-                && keys.contains(Key::KEY_ENTER)
-                && keys.contains(Key::KEY_BACKSPACE)
-        }) {
-            eprintln!(
-                "keyboard: {:?} name={:?} phys={:?}",
-                path,
-                dev.name(),
-                dev.physical_path(),
-            );
-            keyboards.push(dev);
-        }
-    }
-
-    if keyboards.is_empty() {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "no keyboard found",
-        ))
-    } else {
-        Ok(keyboards)
-    }
-}
-
-use std::os::fd::AsRawFd;
-
-fn set_evdev_nonblocking(dev: &evdev::Device) -> std::io::Result<()> {
-    let fd = dev.as_raw_fd();
-
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-fn animated_dots(elapsed: Duration) -> String {
-    let step = elapsed.as_millis() / DOT_ANIMATION_INTERVAL.as_millis();
-    ".".repeat((step % DOT_ANIMATION_STEPS) as usize)
-}
-
-fn greetd_login(
-    stream: &mut UnixStream,
-    username: &str,
-    password: &str,
-    result_tx: &mpsc::Sender<GreetdResult>,
-) -> io::Result<()> {
-    const SESSION_CMD: &str = "/bin/bash";
-
-    send(
-        stream,
-        &Request::CreateSession {
-            username: username.to_owned(),
-        },
-    )?;
-
-    loop {
-        match recv(stream)? {
-            Response::Success => break,
-            Response::AuthMessage {
-                auth_message_type,
-                auth_message,
-            } => {
-                eprintln!("greetd auth message: {auth_message_type:?}: {auth_message}");
-                let response = match auth_message_type {
-                    AuthMessageType::Secret | AuthMessageType::Visible => Some(password.to_owned()),
-                    AuthMessageType::Info => None,
-                    AuthMessageType::Error => {
-                        let _ = send(stream, &Request::CancelSession);
-                        let _ = result_tx.send(GreetdResult::AuthFailure(auth_message));
-                        return Ok(());
-                    }
-                };
-                send(stream, &Request::PostAuthMessageResponse { response })?;
-            }
-            Response::Error {
-                error_type,
-                description,
-            } => {
-                let _ = send(stream, &Request::CancelSession);
-                let message = format!("{error_type:?}: {description}");
-                let _ = result_tx.send(GreetdResult::AuthFailure(message));
-                return Ok(());
-            }
-        }
-    }
-
-    result_tx
-        .send(GreetdResult::AuthAccepted)
-        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
-
-    send(
-        stream,
-        &Request::StartSession {
-            cmd: vec![SESSION_CMD.to_owned()],
-            env: vec![],
-        },
-    )?;
-
-    match recv(stream)? {
-        Response::Success => {
-            result_tx
-                .send(GreetdResult::SessionStarted)
-                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
-            Ok(())
-        }
-        Response::Error {
-            error_type,
-            description,
-        } => {
-            let _ = send(stream, &Request::CancelSession);
-            let message = format!("start_session failed: {error_type:?}: {description}");
-            let _ = result_tx.send(GreetdResult::SessionFailed(message.clone()));
-            Ok(())
-        }
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unexpected greetd response after start_session: {other:?}"),
-        )),
-    }
-}
-
-enum GreetdCommand {
-    Authenticate { username: String, password: String },
-}
-
-enum GreetdResult {
-    AuthAccepted,
-    AuthFailure(String),
-    SessionStarted,
-    SessionFailed(String),
-}
-
-fn spawn_greetd_worker(
-    sock_path: String,
-) -> (mpsc::Sender<GreetdCommand>, mpsc::Receiver<GreetdResult>) {
-    let (command_tx, command_rx) = mpsc::channel();
-    let (result_tx, result_rx) = mpsc::channel();
-
-    thread::spawn(move || {
-        for command in command_rx {
-            match command {
-                GreetdCommand::Authenticate { username, password } => {
-                    let result = match UnixStream::connect(&sock_path) {
-                        Ok(mut stream) => {
-                            match greetd_login(&mut stream, &username, &password, &result_tx) {
-                                Ok(()) => None,
-                                Err(e) => Some(GreetdResult::AuthFailure(e.to_string())),
-                            }
-                        }
-                        Err(e) => Some(GreetdResult::AuthFailure(format!(
-                            "connect GREETD_SOCK {sock_path:?}: {e}"
-                        ))),
-                    };
-
-                    let Some(result) = result else {
-                        continue;
-                    };
-
-                    if result_tx.send(result).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    (command_tx, result_rx)
-}
 
 // ---------------------------------------------------------------------------
 // DRM device wrapper
@@ -1179,30 +856,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let msg = match &state {
-            LoginState::UsernameInput { username } => format!("Hello {}_", username),
-            LoginState::PasswordInput { username, password } => format!(
-                "Hello {}\n{}_",
-                username,
-                password.chars().map(|_| '*').collect::<String>()
-            ),
-            LoginState::Authenticating { username } => {
-                format!(
-                    "Hello {}\nauthenticating{}",
-                    username,
-                    animated_dots(this_state.elapsed())
-                )
-            }
-            LoginState::StartingSession { username } => {
-                format!(
-                    "Hello {}\nstarting session{}",
-                    username,
-                    animated_dots(this_state.elapsed())
-                )
-            }
-            LoginState::Failure { username } => format!("Hello {}\nlogin failed", username),
-            LoginState::Success => format!(""),
-        };
+        let msg = state.message(this_state.elapsed());
 
         let t = start.elapsed().as_secs_f32();
         let state_time = this_state.elapsed().as_secs_f32();
@@ -1296,6 +950,23 @@ struct BackgroundScene {
 }
 
 impl BackgroundScene {
+    const BG_VSHAD: &str = "attribute vec2 a_pos; \
+    attribute vec2 a_uv; \
+    varying vec2 v_uv; \
+    void main() { \
+        gl_Position = vec4(a_pos, 0.0, 1.0); \
+        v_uv = a_uv; \
+    }";
+
+    //gl_FragColor = vec4(0.117647, 0.117647, 0.180392 + ((v_uv.x + u_time) / 10000.0) , 1.0); \
+    //gl_FragColor = vec4(v_uv, 0.4 + sin(u_time), 1.0);
+    const BG_FSHAD: &str = "precision mediump float; \
+    varying vec2 v_uv; \
+    uniform float u_time; \
+    void main() { \
+        gl_FragColor = vec4(0.117647, 0.117647, 0.180392 + ((v_uv.x + u_time) / 10000.0) , 1.0); \
+    }";
+
     fn new(gl: &glow::Context, w: u32, h: u32) -> Result<Self, Box<dyn std::error::Error>> {
         #[rustfmt::skip]
         let verts: [f32; 16] = [
@@ -1361,8 +1032,9 @@ impl BackgroundScene {
             let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
             assert_eq!(status, glow::FRAMEBUFFER_COMPLETE);
 
-            let scene_vshad = compile_shader(&gl, glow::VERTEX_SHADER, BG_VSHAD)?;
-            let scene_fshad = compile_shader(&gl, glow::FRAGMENT_SHADER, BG_FSHAD)?;
+            let scene_vshad = compile_shader(&gl, glow::VERTEX_SHADER, BackgroundScene::BG_VSHAD)?;
+            let scene_fshad =
+                compile_shader(&gl, glow::FRAGMENT_SHADER, BackgroundScene::BG_FSHAD)?;
             let scene_program = link_program(&gl, scene_vshad, scene_fshad)?;
             gl.delete_shader(scene_vshad);
             gl.delete_shader(scene_fshad);
@@ -1419,11 +1091,45 @@ struct TextScene {
     text_time_loc: glow::UniformLocation,
 }
 impl TextScene {
+    const TEXT_VSHAD: &str = "precision mediump float; \
+    attribute vec2 a_pos; \
+    attribute vec2 a_uv; \
+    attribute float a_blink; \
+    varying vec2 v_uv; \
+    varying float v_blink; \
+    uniform vec2 u_resolution; \
+    uniform vec2 u_translate; \
+    void main() { \
+        v_blink = a_blink; \
+        vec2 clip = vec2( \
+            (u_translate.x + a_pos.x) / u_resolution.x * 2.0 - 1.0, \
+            (u_translate.y + 1.0 - a_pos.y) / u_resolution.y * 2.0 \
+        ); \
+        gl_Position = vec4(clip, 0.0, 1.0); \
+        v_uv = a_uv; \
+    } \
+";
+    const TEXT_FSHAD: &str = "precision mediump float; \
+    uniform sampler2D u_font; \
+    uniform vec4 u_color; \
+    uniform float u_time; \
+    varying vec2 v_uv; \
+    varying float v_blink; \
+    void main() { \
+       float alpha = texture2D(u_font, v_uv).a; \
+        if (v_blink > 0.0) {
+
+    alpha *= step(0.5, fract(u_time * 1.50));
+    }
+       gl_FragColor = vec4(u_color.rgb, u_color.a * alpha ); \
+    } \
+";
+
     fn new(gl: &glow::Context, scale: usize) -> Result<Self, Box<dyn std::error::Error>> {
         unsafe {
             // create text rendering prog
-            let text_vshad = compile_shader(&gl, glow::VERTEX_SHADER, TEXT_VSHAD)?;
-            let text_fshad = compile_shader(&gl, glow::FRAGMENT_SHADER, TEXT_FSHAD)?;
+            let text_vshad = compile_shader(&gl, glow::VERTEX_SHADER, TextScene::TEXT_VSHAD)?;
+            let text_fshad = compile_shader(&gl, glow::FRAGMENT_SHADER, TextScene::TEXT_FSHAD)?;
             let text_program = link_program(&gl, text_vshad, text_fshad)?;
             gl.delete_shader(text_vshad);
             gl.delete_shader(text_fshad);
@@ -1614,6 +1320,62 @@ struct PostprocScene {
 }
 
 impl PostprocScene {
+    const POST_VSHAD: &str = "attribute vec2 a_pos; attribute vec2 a_uv; varying vec2 v_uv; \
+             void main() { gl_Position = vec4(a_pos, 0.0, 1.0); v_uv = a_uv; }";
+    const POST_FSHAD: &str = "precision highp float; \
+             uniform sampler2D u_tex; \
+	             uniform float u_time; \
+	             uniform float u_aspect; \
+	             uniform vec2 u_resolution; \
+	             uniform int u_login_state; \
+	             uniform float u_state_time; \
+	             varying vec2 v_uv; \
+                 float hash(float n) { n = fract(n * 0.1031); n *= n + 33.33; n *= n + n; return fract(n); } \
+	             void main() { \
+                 vec2 centered = v_uv * 2.0 - 1.0; \
+                 centered.x *= u_aspect; \
+                 float r2 = dot(centered, centered); \
+	                 vec2 curved = centered * (1.0 + 0.018 * r2); \
+	                 curved.x /= u_aspect; \
+	                 vec2 uv = curved * 0.5 + 0.5; \
+	                 vec2 feather = 4.0 / u_resolution; \
+	                 vec2 edge = smoothstep(vec2(0.0), feather, uv) * smoothstep(vec2(0.0), feather, 1.0 - uv); \
+	                 float screen_mask = edge.x * edge.y; \
+	                 uv = clamp(uv, vec2(0.0), vec2(1.0)); \
+	                 float burst = pow(max(0.0, sin(u_time * 0.7 + sin(u_time * 0.19) * 2.4)), 18.0); \
+                         float failure_hit = 0.0; \
+                         if (u_login_state == 4) { failure_hit = exp(-u_state_time * 2.8); } \
+                         float glitch_band = floor(uv.y * 48.0); \
+                         float glitch_tick = mod(floor(u_time * 18.0), 64.0); \
+                         float glitch_gate = step(0.72, hash(glitch_band * 17.0 + glitch_tick)); \
+                         float glitch_offset = (hash(glitch_band * 61.0 + glitch_tick * 7.0) - 0.5) * 0.09 * failure_hit * glitch_gate; \
+		                 uv.x += sin(uv.y * 42.0 + u_time * 18.0) * 0.0025 * burst + glitch_offset; \
+                         uv.x = fract(uv.x); \
+		                 uv = clamp(uv, vec2(0.0), vec2(1.0)); \
+                 vec2 px = 1.0 / u_resolution; \
+                 float aberration = 0.0007 + 0.0012 * r2 + 0.006 * failure_hit; \
+                 float red = texture2D(u_tex, uv + vec2(aberration, 0.0)).r; \
+                 float green = texture2D(u_tex, uv).g; \
+                 float blue = texture2D(u_tex, uv - vec2(aberration, 0.0)).b; \
+                 vec4 base = vec4(red, green, blue, 1.0); \
+                 vec3 glow = texture2D(u_tex, uv + vec2(px.x * 2.0, 0.0)).rgb; \
+                 glow += texture2D(u_tex, uv - vec2(px.x * 2.0, 0.0)).rgb; \
+                 glow += texture2D(u_tex, uv + vec2(0.0, px.y * 2.0)).rgb; \
+                 glow += texture2D(u_tex, uv - vec2(0.0, px.y * 2.0)).rgb; \
+                 glow *= 0.25; \
+                 float scanline = 0.965 + 0.035 * sin(uv.y * u_resolution.y * 3.14159); \
+                 float vignette = smoothstep(1.18, 0.35, length(centered)); \
+                 float luma = dot(base.rgb, vec3(0.299, 0.587, 0.114)); \
+                 float white_variation = 1.0 + 0.045 * sin(u_time * 1.7 + uv.y * 17.0 + uv.x * 5.0); \
+                 vec3 color = base.rgb + glow * 0.22; \
+                 color *= mix(1.0, white_variation, smoothstep(0.45, 0.85, luma)); \
+		                 color *= scanline; \
+		                 color *= 0.88 + 0.12 * vignette; \
+                         color += vec3(0.02, 0.025, 0.04) * burst; \
+                         color = mix(color, vec3(color.r + 0.45, color.g * 0.55, color.b * 0.55), failure_hit); \
+		                 color = mix(vec3(0.03, 0.028, 0.04), color, screen_mask); \
+	                 gl_FragColor = vec4(color, 1.0); \
+	             }";
     fn new(gl: &glow::Context) -> Result<Self, Box<dyn std::error::Error>> {
         let verts: [f32; 16] = [
             -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 0.0, 0.0, 1.0, -1.0, 1.0, 0.0,
@@ -1630,8 +1392,8 @@ impl PostprocScene {
             // restore the fbo to default and bind texture to the scene_tex we rendered into
 
             // Minimal GLSL ES shader: fullscreen textured quad.
-            let vs = compile_shader(&gl, glow::VERTEX_SHADER, POST_VSHAD)?;
-            let fs = compile_shader(&gl, glow::FRAGMENT_SHADER, POST_FSHAD)?;
+            let vs = compile_shader(&gl, glow::VERTEX_SHADER, PostprocScene::POST_VSHAD)?;
+            let fs = compile_shader(&gl, glow::FRAGMENT_SHADER, PostprocScene::POST_FSHAD)?;
             let prog = link_program(&gl, vs, fs)?;
             gl.use_program(Some(prog));
             gl.delete_shader(vs);
@@ -1703,452 +1465,5 @@ impl PostprocScene {
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         }
         Ok(())
-    }
-}
-
-enum LoginState {
-    UsernameInput { username: String },
-    PasswordInput { username: String, password: String },
-    Authenticating { username: String },
-    StartingSession { username: String },
-    Failure { username: String },
-    Success,
-}
-
-enum LoginEvent {
-    Char(char),
-    Delete,
-    Submit,
-    PreviousField,
-    AuthAccepted,
-    AuthFailure,
-    SessionStarted,
-    SessionFailure,
-    TimerOver,
-}
-
-enum LoginAction {
-    Authenticate { username: String, password: String },
-    Exit,
-}
-
-struct LoginTransition {
-    state: LoginState,
-    action: Option<LoginAction>,
-    reset_timer: bool,
-}
-
-impl LoginTransition {
-    fn stay(state: LoginState) -> Self {
-        Self {
-            state,
-            action: None,
-            reset_timer: false,
-        }
-    }
-
-    fn change(state: LoginState) -> Self {
-        Self {
-            state,
-            action: None,
-            reset_timer: true,
-        }
-    }
-
-    fn change_with_action(state: LoginState, action: LoginAction) -> Self {
-        Self {
-            state,
-            action: Some(action),
-            reset_timer: true,
-        }
-    }
-}
-
-impl Default for LoginState {
-    fn default() -> Self {
-        Self::UsernameInput {
-            username: String::with_capacity(256),
-        }
-    }
-}
-
-impl LoginState {
-    fn visual_state(&self) -> i32 {
-        match self {
-            LoginState::UsernameInput { .. } => 0,
-            LoginState::PasswordInput { .. } => 1,
-            LoginState::Authenticating { .. } => 2,
-            LoginState::StartingSession { .. } => 3,
-            LoginState::Failure { .. } => 4,
-            LoginState::Success => 5,
-        }
-    }
-
-    fn update(self, ev: LoginEvent) -> LoginTransition {
-        match (self, ev) {
-            (LoginState::UsernameInput { mut username }, LoginEvent::Char(c)) => {
-                username.push(c);
-                LoginTransition::stay(LoginState::UsernameInput { username })
-            }
-            (LoginState::UsernameInput { mut username }, LoginEvent::Delete) => {
-                username.pop();
-                LoginTransition::stay(LoginState::UsernameInput { username })
-            }
-            (LoginState::UsernameInput { username }, LoginEvent::Submit)
-                if !username.is_empty() =>
-            {
-                LoginTransition::change(LoginState::PasswordInput {
-                    username,
-                    password: String::new(),
-                })
-            }
-            (
-                LoginState::PasswordInput {
-                    username,
-                    mut password,
-                },
-                LoginEvent::Char(c),
-            ) => {
-                password.push(c);
-                LoginTransition::stay(LoginState::PasswordInput { username, password })
-            }
-            (
-                LoginState::PasswordInput {
-                    username,
-                    mut password,
-                },
-                LoginEvent::Delete,
-            ) => {
-                password.pop();
-                LoginTransition::stay(LoginState::PasswordInput { username, password })
-            }
-            (LoginState::PasswordInput { username, password }, LoginEvent::Submit) => {
-                LoginTransition::change_with_action(
-                    LoginState::Authenticating {
-                        username: username.clone(),
-                    },
-                    LoginAction::Authenticate { username, password },
-                )
-            }
-            (
-                LoginState::PasswordInput {
-                    username,
-                    password: _,
-                },
-                LoginEvent::PreviousField,
-            ) => LoginTransition::change(LoginState::UsernameInput { username }),
-            (LoginState::Authenticating { username }, LoginEvent::AuthAccepted) => {
-                LoginTransition::change(LoginState::StartingSession { username })
-            }
-            (LoginState::StartingSession { username: _ }, LoginEvent::SessionStarted) => {
-                LoginTransition::change(LoginState::Success)
-            }
-            (LoginState::Authenticating { username }, LoginEvent::AuthFailure) => {
-                LoginTransition::change(LoginState::Failure { username })
-            }
-            (LoginState::StartingSession { username }, LoginEvent::SessionFailure) => {
-                LoginTransition::change(LoginState::Failure { username })
-            }
-            (LoginState::Failure { username }, LoginEvent::Char(c)) => {
-                let password = String::from(c);
-                LoginTransition::change(LoginState::PasswordInput { username, password })
-            }
-            (LoginState::Failure { username }, LoginEvent::PreviousField) => {
-                LoginTransition::change(LoginState::UsernameInput { username })
-            }
-            (LoginState::Success, LoginEvent::TimerOver) => {
-                LoginTransition::change_with_action(LoginState::Success, LoginAction::Exit)
-            }
-            (s, _) => LoginTransition::stay(s),
-        }
-    }
-}
-
-struct KeyboardInput {
-    keyboards: Vec<EvDevice>,
-    shift: bool,
-    caps_lock: bool,
-}
-
-impl KeyboardInput {
-    fn new(keyboards: Vec<EvDevice>) -> Self {
-        let caps_lock = keyboards.iter().any(|keyboard| {
-            keyboard
-                .get_led_state()
-                .is_ok_and(|leds| leds.contains(evdev::LedType::LED_CAPSL))
-        });
-
-        Self {
-            keyboards,
-            shift: false,
-            caps_lock,
-        }
-    }
-
-    fn read_events(&mut self) -> io::Result<Vec<LoginEvent>> {
-        let mut login_events = Vec::new();
-
-        for idx in 0..self.keyboards.len() {
-            let key_events = match self.keyboards[idx].fetch_events() {
-                Ok(events) => events
-                    .filter(|ev| ev.event_type() == EventType::KEY)
-                    .map(|ev| (Key(ev.code()), ev.value()))
-                    .collect::<Vec<_>>(),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) if e.raw_os_error() == Some(libc::ENODEV) => {
-                    eprintln!("keyboard disappeared: {e}");
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-
-            for (key, value) in key_events {
-                self.update_modifiers(key, value);
-
-                if value == 0 {
-                    continue;
-                }
-
-                if let Some(login_event) = Self::map_key(key, self.shift, self.caps_lock) {
-                    login_events.push(login_event);
-                }
-            }
-        }
-
-        Ok(login_events)
-    }
-
-    fn update_modifiers(&mut self, key: Key, value: i32) {
-        match key {
-            Key::KEY_LEFTSHIFT | Key::KEY_RIGHTSHIFT => {
-                self.shift = value != 0;
-            }
-            Key::KEY_CAPSLOCK if value == 1 => {
-                self.caps_lock = !self.caps_lock;
-            }
-            _ => {}
-        }
-    }
-
-    fn map_key(key: Key, shift: bool, caps_lock: bool) -> Option<LoginEvent> {
-        match key {
-            Key::KEY_ENTER => Some(LoginEvent::Submit),
-            Key::KEY_KPENTER => Some(LoginEvent::Submit),
-            Key::KEY_BACKSPACE => Some(LoginEvent::Delete),
-            Key::KEY_UP => Some(LoginEvent::PreviousField),
-            Key::KEY_ESC => Some(LoginEvent::PreviousField),
-            Key::KEY_SPACE => Some(LoginEvent::Char(' ')),
-            key => Self::map_printable_key(key, shift, caps_lock).map(LoginEvent::Char),
-        }
-    }
-
-    fn map_printable_key(key: Key, shift: bool, caps_lock: bool) -> Option<char> {
-        if let Some(c) = Self::map_letter_key(key) {
-            let upper = shift ^ caps_lock;
-            return Some(if upper { c.to_ascii_uppercase() } else { c });
-        }
-
-        let c = match key {
-            Key::KEY_1 => {
-                if shift {
-                    '!'
-                } else {
-                    '1'
-                }
-            }
-            Key::KEY_2 => {
-                if shift {
-                    '@'
-                } else {
-                    '2'
-                }
-            }
-            Key::KEY_3 => {
-                if shift {
-                    '#'
-                } else {
-                    '3'
-                }
-            }
-            Key::KEY_4 => {
-                if shift {
-                    '$'
-                } else {
-                    '4'
-                }
-            }
-            Key::KEY_5 => {
-                if shift {
-                    '%'
-                } else {
-                    '5'
-                }
-            }
-            Key::KEY_6 => {
-                if shift {
-                    '^'
-                } else {
-                    '6'
-                }
-            }
-            Key::KEY_7 => {
-                if shift {
-                    '&'
-                } else {
-                    '7'
-                }
-            }
-            Key::KEY_8 => {
-                if shift {
-                    '*'
-                } else {
-                    '8'
-                }
-            }
-            Key::KEY_9 => {
-                if shift {
-                    '('
-                } else {
-                    '9'
-                }
-            }
-            Key::KEY_0 => {
-                if shift {
-                    ')'
-                } else {
-                    '0'
-                }
-            }
-            Key::KEY_MINUS => {
-                if shift {
-                    '_'
-                } else {
-                    '-'
-                }
-            }
-            Key::KEY_EQUAL => {
-                if shift {
-                    '+'
-                } else {
-                    '='
-                }
-            }
-            Key::KEY_LEFTBRACE => {
-                if shift {
-                    '{'
-                } else {
-                    '['
-                }
-            }
-            Key::KEY_RIGHTBRACE => {
-                if shift {
-                    '}'
-                } else {
-                    ']'
-                }
-            }
-            Key::KEY_BACKSLASH => {
-                if shift {
-                    '|'
-                } else {
-                    '\\'
-                }
-            }
-            Key::KEY_SEMICOLON => {
-                if shift {
-                    ':'
-                } else {
-                    ';'
-                }
-            }
-            Key::KEY_APOSTROPHE => {
-                if shift {
-                    '"'
-                } else {
-                    '\''
-                }
-            }
-            Key::KEY_GRAVE => {
-                if shift {
-                    '~'
-                } else {
-                    '`'
-                }
-            }
-            Key::KEY_COMMA => {
-                if shift {
-                    '<'
-                } else {
-                    ','
-                }
-            }
-            Key::KEY_DOT => {
-                if shift {
-                    '>'
-                } else {
-                    '.'
-                }
-            }
-            Key::KEY_SLASH => {
-                if shift {
-                    '?'
-                } else {
-                    '/'
-                }
-            }
-            Key::KEY_KP0 => '0',
-            Key::KEY_KP1 => '1',
-            Key::KEY_KP2 => '2',
-            Key::KEY_KP3 => '3',
-            Key::KEY_KP4 => '4',
-            Key::KEY_KP5 => '5',
-            Key::KEY_KP6 => '6',
-            Key::KEY_KP7 => '7',
-            Key::KEY_KP8 => '8',
-            Key::KEY_KP9 => '9',
-            Key::KEY_KPMINUS => '-',
-            Key::KEY_KPPLUS => '+',
-            Key::KEY_KPASTERISK => '*',
-            Key::KEY_KPSLASH => '/',
-            Key::KEY_KPDOT => '.',
-            _ => return None,
-        };
-
-        Some(c)
-    }
-
-    fn map_letter_key(key: Key) -> Option<char> {
-        const LETTERS: &[(Key, char)] = &[
-            (Key::KEY_A, 'a'),
-            (Key::KEY_B, 'b'),
-            (Key::KEY_C, 'c'),
-            (Key::KEY_D, 'd'),
-            (Key::KEY_E, 'e'),
-            (Key::KEY_F, 'f'),
-            (Key::KEY_G, 'g'),
-            (Key::KEY_H, 'h'),
-            (Key::KEY_I, 'i'),
-            (Key::KEY_J, 'j'),
-            (Key::KEY_K, 'k'),
-            (Key::KEY_L, 'l'),
-            (Key::KEY_M, 'm'),
-            (Key::KEY_N, 'n'),
-            (Key::KEY_O, 'o'),
-            (Key::KEY_P, 'p'),
-            (Key::KEY_Q, 'q'),
-            (Key::KEY_R, 'r'),
-            (Key::KEY_S, 's'),
-            (Key::KEY_T, 't'),
-            (Key::KEY_U, 'u'),
-            (Key::KEY_V, 'v'),
-            (Key::KEY_W, 'w'),
-            (Key::KEY_X, 'x'),
-            (Key::KEY_Y, 'y'),
-            (Key::KEY_Z, 'z'),
-        ];
-
-        LETTERS
-            .iter()
-            .find_map(|(letter_key, c)| (*letter_key == key).then_some(*c))
     }
 }

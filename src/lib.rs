@@ -5,6 +5,10 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+pub mod greetd_client;
+pub mod keyboard;
+pub mod login;
+
 /// Sent by the greeter (client) to greetd (server).
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
