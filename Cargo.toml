@@ -24,11 +24,10 @@ toml = "0.8"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 drm = "0.11"
 evdev = "0.12"
-gbm = { version = "0.14", features = ["drm-support"] }
+gbm = { version = "0.14", default-features = false, features = ["drm-support", "import-egl"] }
 gbm-sys = "0.3"
 khronos-egl = { version = "6.0.0", features = ["static"] }
 libc = "0.2"
-minifb = "0.25"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3.95"
