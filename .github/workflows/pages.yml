@@ -2,7 +2,7 @@ name: GitHub Pages
 
 on:
   push:
-    branches: ["main", "blink"]
+    branches: ["main", "blink", "web"]
   workflow_dispatch:
 
 permissions:
