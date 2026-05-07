@@ -97,7 +97,7 @@ pub struct BackgroundConfig {
     pub kind: BackgroundKind,
     pub path: Option<String>,
     pub color: Option<Color>,
-    pub effect: Option<ShaderConfig>,
+    pub effect: Option<BackgroundEffect>,
 }
 
 impl Default for BackgroundConfig {
@@ -196,6 +196,11 @@ pub enum InputType {
     Terminal,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BackgroundEffect {
+    pub path: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ShaderConfig {
@@ -206,4 +211,33 @@ pub struct ShaderConfig {
 #[serde(default)]
 pub struct PostConfig {
     pub path: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_effect_is_optional() {
+        let config = Config::from_toml_str("").unwrap();
+        assert!(config.background.effect.is_none());
+    }
+
+    #[test]
+    fn background_effect_is_fragment_shader_path() {
+        let config = Config::from_toml_str(
+            r#"
+            [background.effect]
+            path = "fragment.glsl"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.background.effect,
+            Some(BackgroundEffect {
+                path: "fragment.glsl".to_owned(),
+            }),
+        );
+    }
 }

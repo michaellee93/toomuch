@@ -1,10 +1,10 @@
 use drm::Device as DrmDevice;
 use drm::buffer::{
-    DrmFourcc, DrmModifier, Handle as BufferHandle, PlanarBuffer as DrmPlanarBuffer,
+    Buffer as DrmBuffer, DrmFourcc, DrmModifier, Handle as BufferHandle,
+    PlanarBuffer as DrmPlanarBuffer,
 };
 use drm::control::{
-    Device as ControlDevice, Event, FbCmd2Flags, Mode, PageFlipFlags, connector, crtc,
-    framebuffer,
+    Device as ControlDevice, Event, FbCmd2Flags, Mode, PageFlipFlags, connector, crtc, framebuffer,
 };
 use evdev::Device as EvDevice;
 use font8x8::legacy::BASIC_LEGACY;
@@ -75,7 +75,7 @@ const TEXT_FSHAD: &str = "precision mediump float; \
 ";
 const POST_VSHAD: &str = "attribute vec2 a_pos; attribute vec2 a_uv; varying vec2 v_uv; \
              void main() { gl_Position = vec4(a_pos, 0.0, 1.0); v_uv = a_uv; }";
-const POST_FSHAD: &str = "precision mediump float; \
+const POST_FSHAD: &str = "precision highp float; \
              uniform sampler2D u_tex; \
 	             uniform float u_time; \
 	             uniform float u_aspect; \
@@ -83,7 +83,7 @@ const POST_FSHAD: &str = "precision mediump float; \
 	             uniform int u_login_state; \
 	             uniform float u_state_time; \
 	             varying vec2 v_uv; \
-                 float hash(float n) { return fract(sin(n) * 43758.5453123); } \
+                 float hash(float n) { n = fract(n * 0.1031); n *= n + 33.33; n *= n + n; return fract(n); } \
 	             void main() { \
                  vec2 centered = v_uv * 2.0 - 1.0; \
                  centered.x *= u_aspect; \
@@ -99,7 +99,7 @@ const POST_FSHAD: &str = "precision mediump float; \
                          float failure_hit = 0.0; \
                          if (u_login_state == 4) { failure_hit = exp(-u_state_time * 2.8); } \
                          float glitch_band = floor(uv.y * 48.0); \
-                         float glitch_tick = floor(u_time * 18.0); \
+                         float glitch_tick = mod(floor(u_time * 18.0), 64.0); \
                          float glitch_gate = step(0.72, hash(glitch_band * 17.0 + glitch_tick)); \
                          float glitch_offset = (hash(glitch_band * 61.0 + glitch_tick * 7.0) - 0.5) * 0.09 * failure_hit * glitch_gate; \
 		                 uv.x += sin(uv.y * 42.0 + u_time * 18.0) * 0.0025 * burst + glitch_offset; \
@@ -129,6 +129,9 @@ const POST_FSHAD: &str = "precision mediump float; \
 		                 color = mix(vec3(0.03, 0.028, 0.04), color, screen_mask); \
 	                 gl_FragColor = vec4(color, 1.0); \
 	             }";
+
+const DOT_ANIMATION_INTERVAL: Duration = Duration::from_millis(180);
+const DOT_ANIMATION_STEPS: u128 = 4;
 
 use evdev::{EventType, Key};
 
@@ -165,15 +168,12 @@ fn find_keyboards() -> std::io::Result<Vec<EvDevice>> {
             }
         };
 
-        if dev
-            .supported_keys()
-            .is_some_and(|keys| {
-                keys.contains(Key::KEY_A)
-                    && keys.contains(Key::KEY_Z)
-                    && keys.contains(Key::KEY_ENTER)
-                    && keys.contains(Key::KEY_BACKSPACE)
-            })
-        {
+        if dev.supported_keys().is_some_and(|keys| {
+            keys.contains(Key::KEY_A)
+                && keys.contains(Key::KEY_Z)
+                && keys.contains(Key::KEY_ENTER)
+                && keys.contains(Key::KEY_BACKSPACE)
+        }) {
             eprintln!(
                 "keyboard: {:?} name={:?} phys={:?}",
                 path,
@@ -210,6 +210,11 @@ fn set_evdev_nonblocking(dev: &evdev::Device) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn animated_dots(elapsed: Duration) -> String {
+    let step = elapsed.as_millis() / DOT_ANIMATION_INTERVAL.as_millis();
+    ".".repeat((step % DOT_ANIMATION_STEPS) as usize)
 }
 
 fn greetd_login(
@@ -398,6 +403,26 @@ impl Drop for LockedFrontBuffer {
     }
 }
 
+impl DrmBuffer for LockedFrontBuffer {
+    fn size(&self) -> (u32, u32) {
+        (self.width(), self.height())
+    }
+
+    fn format(&self) -> DrmFourcc {
+        DrmFourcc::try_from(unsafe { gbm_sys::gbm_bo_get_format(self.raw_bo()) })
+            .expect("libgbm returned invalid buffer format")
+    }
+
+    fn pitch(&self) -> u32 {
+        self.stride()
+    }
+
+    fn handle(&self) -> BufferHandle {
+        let handle = unsafe { gbm_sys::gbm_bo_get_handle(self.raw_bo()).u32_ };
+        BufferHandle::from(NonZeroU32::new(handle).expect("libgbm returned zero BO handle"))
+    }
+}
+
 impl DrmPlanarBuffer for LockedFrontBuffer {
     fn size(&self) -> (u32, u32) {
         (self.width(), self.height())
@@ -535,6 +560,13 @@ fn open_display_card() -> Result<(String, GbmDevice<Card>), Box<dyn std::error::
 fn fourcc_string(format: u32) -> String {
     let bytes = format.to_le_bytes();
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn framebuffer_depth(format: Format) -> u32 {
+    match format {
+        Format::Argb8888 | Format::Abgr8888 | Format::Rgba8888 | Format::Bgra8888 => 32,
+        _ => 24,
+    }
 }
 
 fn primary_plane_formats(dev: &impl ControlDevice, crtc_h: crtc::Handle) -> Vec<u32> {
@@ -1070,6 +1102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     let mut current_bo: Option<(framebuffer::Handle, LockedFrontBuffer)> = None;
     let mut logged_bo = false;
+    let mut logged_legacy_fb_fallback = false;
 
     // app state
     let mut state = LoginState::default();
@@ -1154,10 +1187,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 password.chars().map(|_| '*').collect::<String>()
             ),
             LoginState::Authenticating { username } => {
-                format!("Hello {}\nauthenticating", username)
+                format!(
+                    "Hello {}\nauthenticating{}",
+                    username,
+                    animated_dots(this_state.elapsed())
+                )
             }
             LoginState::StartingSession { username } => {
-                format!("Hello {}\nstarting session", username)
+                format!(
+                    "Hello {}\nstarting session{}",
+                    username,
+                    animated_dots(this_state.elapsed())
+                )
             }
             LoginState::Failure { username } => format!("Hello {}\nlogin failed", username),
             LoginState::Success => format!(""),
@@ -1189,16 +1230,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "bo: {}x{} format={:?} stride={} modifier={:?}",
                 bo.width(),
                 bo.height(),
-                bo.format(),
+                DrmPlanarBuffer::format(&bo),
                 bo.stride(),
                 bo.modifier()
             );
             logged_bo = true;
         }
 
-        let fb = gbm
-            .add_planar_framebuffer(&bo, FbCmd2Flags::MODIFIERS)
-            .map_err(|e| format!("add_planar_framebuffer: {e}"))?;
+        let fb = match gbm.add_planar_framebuffer(&bo, FbCmd2Flags::MODIFIERS) {
+            Ok(fb) => fb,
+            Err(planar_error) => {
+                if !logged_legacy_fb_fallback {
+                    eprintln!(
+                        "add_planar_framebuffer failed, falling back to add_framebuffer: {planar_error}"
+                    );
+                    logged_legacy_fb_fallback = true;
+                }
+                gbm.add_framebuffer(&bo, framebuffer_depth(gbm_format), 32)
+                    .map_err(|e| {
+                        format!(
+                            "add_planar_framebuffer: {planar_error}; add_framebuffer fallback: {e}"
+                        )
+                    })?
+            }
+        };
 
         if current_bo.is_none() {
             eprintln!(
@@ -1817,13 +1872,11 @@ struct KeyboardInput {
 
 impl KeyboardInput {
     fn new(keyboards: Vec<EvDevice>) -> Self {
-        let caps_lock = keyboards
-            .iter()
-            .any(|keyboard| {
-                keyboard
-                    .get_led_state()
-                    .is_ok_and(|leds| leds.contains(evdev::LedType::LED_CAPSL))
-            });
+        let caps_lock = keyboards.iter().any(|keyboard| {
+            keyboard
+                .get_led_state()
+                .is_ok_and(|leds| leds.contains(evdev::LedType::LED_CAPSL))
+        });
 
         Self {
             keyboards,
@@ -1897,67 +1950,151 @@ impl KeyboardInput {
 
         let c = match key {
             Key::KEY_1 => {
-                if shift { '!' } else { '1' }
+                if shift {
+                    '!'
+                } else {
+                    '1'
+                }
             }
             Key::KEY_2 => {
-                if shift { '@' } else { '2' }
+                if shift {
+                    '@'
+                } else {
+                    '2'
+                }
             }
             Key::KEY_3 => {
-                if shift { '#' } else { '3' }
+                if shift {
+                    '#'
+                } else {
+                    '3'
+                }
             }
             Key::KEY_4 => {
-                if shift { '$' } else { '4' }
+                if shift {
+                    '$'
+                } else {
+                    '4'
+                }
             }
             Key::KEY_5 => {
-                if shift { '%' } else { '5' }
+                if shift {
+                    '%'
+                } else {
+                    '5'
+                }
             }
             Key::KEY_6 => {
-                if shift { '^' } else { '6' }
+                if shift {
+                    '^'
+                } else {
+                    '6'
+                }
             }
             Key::KEY_7 => {
-                if shift { '&' } else { '7' }
+                if shift {
+                    '&'
+                } else {
+                    '7'
+                }
             }
             Key::KEY_8 => {
-                if shift { '*' } else { '8' }
+                if shift {
+                    '*'
+                } else {
+                    '8'
+                }
             }
             Key::KEY_9 => {
-                if shift { '(' } else { '9' }
+                if shift {
+                    '('
+                } else {
+                    '9'
+                }
             }
             Key::KEY_0 => {
-                if shift { ')' } else { '0' }
+                if shift {
+                    ')'
+                } else {
+                    '0'
+                }
             }
             Key::KEY_MINUS => {
-                if shift { '_' } else { '-' }
+                if shift {
+                    '_'
+                } else {
+                    '-'
+                }
             }
             Key::KEY_EQUAL => {
-                if shift { '+' } else { '=' }
+                if shift {
+                    '+'
+                } else {
+                    '='
+                }
             }
             Key::KEY_LEFTBRACE => {
-                if shift { '{' } else { '[' }
+                if shift {
+                    '{'
+                } else {
+                    '['
+                }
             }
             Key::KEY_RIGHTBRACE => {
-                if shift { '}' } else { ']' }
+                if shift {
+                    '}'
+                } else {
+                    ']'
+                }
             }
             Key::KEY_BACKSLASH => {
-                if shift { '|' } else { '\\' }
+                if shift {
+                    '|'
+                } else {
+                    '\\'
+                }
             }
             Key::KEY_SEMICOLON => {
-                if shift { ':' } else { ';' }
+                if shift {
+                    ':'
+                } else {
+                    ';'
+                }
             }
             Key::KEY_APOSTROPHE => {
-                if shift { '"' } else { '\'' }
+                if shift {
+                    '"'
+                } else {
+                    '\''
+                }
             }
             Key::KEY_GRAVE => {
-                if shift { '~' } else { '`' }
+                if shift {
+                    '~'
+                } else {
+                    '`'
+                }
             }
             Key::KEY_COMMA => {
-                if shift { '<' } else { ',' }
+                if shift {
+                    '<'
+                } else {
+                    ','
+                }
             }
             Key::KEY_DOT => {
-                if shift { '>' } else { '.' }
+                if shift {
+                    '>'
+                } else {
+                    '.'
+                }
             }
             Key::KEY_SLASH => {
-                if shift { '?' } else { '/' }
+                if shift {
+                    '?'
+                } else {
+                    '/'
+                }
             }
             Key::KEY_KP0 => '0',
             Key::KEY_KP1 => '1',
