@@ -29,7 +29,7 @@ fn handle(mut stream: UnixStream) -> io::Result<()> {
             Request::PostAuthMessageResponse { response } => {
                 match response.as_deref() {
                     // Accept anything non-empty; reject empty/None.
-                    Some(pw) if !pw.is_empty() => Response::Success,
+                    Some("password") => Response::Success,
                     _ => Response::Error {
                         error_type: ErrorType::AuthError,
                         description: "Authentication failure".into(),

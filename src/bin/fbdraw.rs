@@ -1,17 +1,28 @@
 use drm::Device as DrmDevice;
+use drm::buffer::{
+    DrmFourcc, DrmModifier, Handle as BufferHandle, PlanarBuffer as DrmPlanarBuffer,
+};
 use drm::control::{
-    Device as ControlDevice, Event, Mode, PageFlipFlags, connector, crtc, framebuffer,
+    Device as ControlDevice, Event, FbCmd2Flags, Mode, PageFlipFlags, connector, crtc,
+    framebuffer,
 };
 use evdev::Device as EvDevice;
 use font8x8::legacy::BASIC_LEGACY;
-use gbm::{AsRaw, BufferObject, BufferObjectFlags, Device as GbmDevice, Format};
+use gbm::{AsRaw, BufferObjectFlags, Device as GbmDevice, Format};
 use glow::{COLOR_BUFFER_BIT, HasContext, NativeBuffer, NativeProgram, NativeTexture};
 use khronos_egl as egl;
+use shlog::{AuthMessageType, Request, Response, recv, send};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs::{self, OpenOptions};
+use std::io;
+use std::num::NonZeroU32;
 use std::os::fd::{AsFd, BorrowedFd};
-use std::time::Instant;
+use std::os::unix::net::UnixStream;
+use std::ptr::NonNull;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 const BG_VSHAD: &str = "attribute vec2 a_pos; \
     attribute vec2 a_uv; \
@@ -66,11 +77,14 @@ const POST_VSHAD: &str = "attribute vec2 a_pos; attribute vec2 a_uv; varying vec
              void main() { gl_Position = vec4(a_pos, 0.0, 1.0); v_uv = a_uv; }";
 const POST_FSHAD: &str = "precision mediump float; \
              uniform sampler2D u_tex; \
-             uniform float u_time; \
-             uniform float u_aspect; \
-             uniform vec2 u_resolution; \
-             varying vec2 v_uv; \
-             void main() { \
+	             uniform float u_time; \
+	             uniform float u_aspect; \
+	             uniform vec2 u_resolution; \
+	             uniform int u_login_state; \
+	             uniform float u_state_time; \
+	             varying vec2 v_uv; \
+                 float hash(float n) { return fract(sin(n) * 43758.5453123); } \
+	             void main() { \
                  vec2 centered = v_uv * 2.0 - 1.0; \
                  centered.x *= u_aspect; \
                  float r2 = dot(centered, centered); \
@@ -82,10 +96,17 @@ const POST_FSHAD: &str = "precision mediump float; \
 	                 float screen_mask = edge.x * edge.y; \
 	                 uv = clamp(uv, vec2(0.0), vec2(1.0)); \
 	                 float burst = pow(max(0.0, sin(u_time * 0.7 + sin(u_time * 0.19) * 2.4)), 18.0); \
-	                 uv.x += sin(uv.y * 42.0 + u_time * 18.0) * 0.0025 * burst; \
-	                 uv = clamp(uv, vec2(0.0), vec2(1.0)); \
+                         float failure_hit = 0.0; \
+                         if (u_login_state == 4) { failure_hit = exp(-u_state_time * 2.8); } \
+                         float glitch_band = floor(uv.y * 48.0); \
+                         float glitch_tick = floor(u_time * 18.0); \
+                         float glitch_gate = step(0.72, hash(glitch_band * 17.0 + glitch_tick)); \
+                         float glitch_offset = (hash(glitch_band * 61.0 + glitch_tick * 7.0) - 0.5) * 0.09 * failure_hit * glitch_gate; \
+		                 uv.x += sin(uv.y * 42.0 + u_time * 18.0) * 0.0025 * burst + glitch_offset; \
+                         uv.x = fract(uv.x); \
+		                 uv = clamp(uv, vec2(0.0), vec2(1.0)); \
                  vec2 px = 1.0 / u_resolution; \
-                 float aberration = 0.0007 + 0.0012 * r2; \
+                 float aberration = 0.0007 + 0.0012 * r2 + 0.006 * failure_hit; \
                  float red = texture2D(u_tex, uv + vec2(aberration, 0.0)).r; \
                  float green = texture2D(u_tex, uv).g; \
                  float blue = texture2D(u_tex, uv - vec2(aberration, 0.0)).b; \
@@ -101,43 +122,76 @@ const POST_FSHAD: &str = "precision mediump float; \
                  float white_variation = 1.0 + 0.045 * sin(u_time * 1.7 + uv.y * 17.0 + uv.x * 5.0); \
                  vec3 color = base.rgb + glow * 0.22; \
                  color *= mix(1.0, white_variation, smoothstep(0.45, 0.85, luma)); \
-	                 color *= scanline; \
-	                 color *= 0.88 + 0.12 * vignette; \
-	                 color += vec3(0.02, 0.025, 0.04) * burst; \
-	                 color = mix(vec3(0.03, 0.028, 0.04), color, screen_mask); \
+		                 color *= scanline; \
+		                 color *= 0.88 + 0.12 * vignette; \
+                         color += vec3(0.02, 0.025, 0.04) * burst; \
+                         color = mix(color, vec3(color.r + 0.45, color.g * 0.55, color.b * 0.55), failure_hit); \
+		                 color = mix(vec3(0.03, 0.028, 0.04), color, screen_mask); \
 	                 gl_FragColor = vec4(color, 1.0); \
 	             }";
 
 use evdev::{EventType, Key};
 
 // Keyboard stuff
-fn find_keyboard() -> std::io::Result<EvDevice> {
-    for entry in fs::read_dir("/dev/input")? {
-        let path = entry?.path();
+fn find_keyboards() -> std::io::Result<Vec<EvDevice>> {
+    let mut paths = fs::read_dir("/dev/input")?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("event"))
+        })
+        .collect::<Vec<_>>();
 
-        if !path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("event"))
-        {
-            continue;
-        }
+    paths.sort();
 
-        let dev = EvDevice::open(&path)?;
+    let mut keyboards = Vec::new();
+
+    for path in paths {
+        let dev = match EvDevice::open(&path) {
+            Ok(dev) => dev,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                eprintln!("skip input {path:?}: disappeared");
+                continue;
+            }
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skip input {path:?}: permission denied");
+                continue;
+            }
+            Err(e) => {
+                eprintln!("skip input {path:?}: {e}");
+                continue;
+            }
+        };
 
         if dev
             .supported_keys()
-            .is_some_and(|keys| keys.contains(Key::KEY_A) && keys.contains(Key::KEY_ENTER))
+            .is_some_and(|keys| {
+                keys.contains(Key::KEY_A)
+                    && keys.contains(Key::KEY_Z)
+                    && keys.contains(Key::KEY_ENTER)
+                    && keys.contains(Key::KEY_BACKSPACE)
+            })
         {
-            eprintln!("keyboard: {:?}", path);
-            return Ok(dev);
+            eprintln!(
+                "keyboard: {:?} name={:?} phys={:?}",
+                path,
+                dev.name(),
+                dev.physical_path(),
+            );
+            keyboards.push(dev);
         }
     }
 
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "no keyboard found",
-    ))
+    if keyboards.is_empty() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no keyboard found",
+        ))
+    } else {
+        Ok(keyboards)
+    }
 }
 
 use std::os::fd::AsRawFd;
@@ -158,6 +212,135 @@ fn set_evdev_nonblocking(dev: &evdev::Device) -> std::io::Result<()> {
     Ok(())
 }
 
+fn greetd_login(
+    stream: &mut UnixStream,
+    username: &str,
+    password: &str,
+    result_tx: &mpsc::Sender<GreetdResult>,
+) -> io::Result<()> {
+    const SESSION_CMD: &str = "/bin/bash";
+
+    send(
+        stream,
+        &Request::CreateSession {
+            username: username.to_owned(),
+        },
+    )?;
+
+    loop {
+        match recv(stream)? {
+            Response::Success => break,
+            Response::AuthMessage {
+                auth_message_type,
+                auth_message,
+            } => {
+                eprintln!("greetd auth message: {auth_message_type:?}: {auth_message}");
+                let response = match auth_message_type {
+                    AuthMessageType::Secret | AuthMessageType::Visible => Some(password.to_owned()),
+                    AuthMessageType::Info => None,
+                    AuthMessageType::Error => {
+                        let _ = send(stream, &Request::CancelSession);
+                        let _ = result_tx.send(GreetdResult::AuthFailure(auth_message));
+                        return Ok(());
+                    }
+                };
+                send(stream, &Request::PostAuthMessageResponse { response })?;
+            }
+            Response::Error {
+                error_type,
+                description,
+            } => {
+                let _ = send(stream, &Request::CancelSession);
+                let message = format!("{error_type:?}: {description}");
+                let _ = result_tx.send(GreetdResult::AuthFailure(message));
+                return Ok(());
+            }
+        }
+    }
+
+    result_tx
+        .send(GreetdResult::AuthAccepted)
+        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+
+    send(
+        stream,
+        &Request::StartSession {
+            cmd: vec![SESSION_CMD.to_owned()],
+            env: vec![],
+        },
+    )?;
+
+    match recv(stream)? {
+        Response::Success => {
+            result_tx
+                .send(GreetdResult::SessionStarted)
+                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+            Ok(())
+        }
+        Response::Error {
+            error_type,
+            description,
+        } => {
+            let _ = send(stream, &Request::CancelSession);
+            let message = format!("start_session failed: {error_type:?}: {description}");
+            let _ = result_tx.send(GreetdResult::SessionFailed(message.clone()));
+            Ok(())
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected greetd response after start_session: {other:?}"),
+        )),
+    }
+}
+
+enum GreetdCommand {
+    Authenticate { username: String, password: String },
+}
+
+enum GreetdResult {
+    AuthAccepted,
+    AuthFailure(String),
+    SessionStarted,
+    SessionFailed(String),
+}
+
+fn spawn_greetd_worker(
+    sock_path: String,
+) -> (mpsc::Sender<GreetdCommand>, mpsc::Receiver<GreetdResult>) {
+    let (command_tx, command_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        for command in command_rx {
+            match command {
+                GreetdCommand::Authenticate { username, password } => {
+                    let result = match UnixStream::connect(&sock_path) {
+                        Ok(mut stream) => {
+                            match greetd_login(&mut stream, &username, &password, &result_tx) {
+                                Ok(()) => None,
+                                Err(e) => Some(GreetdResult::AuthFailure(e.to_string())),
+                            }
+                        }
+                        Err(e) => Some(GreetdResult::AuthFailure(format!(
+                            "connect GREETD_SOCK {sock_path:?}: {e}"
+                        ))),
+                    };
+
+                    let Some(result) = result else {
+                        continue;
+                    };
+
+                    if result_tx.send(result).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    (command_tx, result_rx)
+}
+
 // ---------------------------------------------------------------------------
 // DRM device wrapper
 // ---------------------------------------------------------------------------
@@ -173,6 +356,224 @@ impl AsFd for Card {
 impl DrmDevice for Card {}
 impl ControlDevice for Card {}
 
+struct LockedFrontBuffer {
+    surface: *mut gbm_sys::gbm_surface,
+    bo: NonNull<gbm_sys::gbm_bo>,
+}
+
+impl LockedFrontBuffer {
+    unsafe fn lock<T>(surface: &gbm::Surface<T>) -> Result<Self, Box<dyn std::error::Error>> {
+        let surface = surface.as_raw_mut() as *mut gbm_sys::gbm_surface;
+        let bo = unsafe { gbm_sys::gbm_surface_lock_front_buffer(surface) };
+        let bo = NonNull::new(bo).ok_or("gbm_surface_lock_front_buffer returned null")?;
+        Ok(Self { surface, bo })
+    }
+
+    fn raw_bo(&self) -> *mut gbm_sys::gbm_bo {
+        self.bo.as_ptr()
+    }
+
+    fn width(&self) -> u32 {
+        unsafe { gbm_sys::gbm_bo_get_width(self.raw_bo()) }
+    }
+
+    fn height(&self) -> u32 {
+        unsafe { gbm_sys::gbm_bo_get_height(self.raw_bo()) }
+    }
+
+    fn stride(&self) -> u32 {
+        unsafe { gbm_sys::gbm_bo_get_stride(self.raw_bo()) }
+    }
+
+    fn plane_count(&self) -> u32 {
+        unsafe { gbm_sys::gbm_bo_get_plane_count(self.raw_bo()) as u32 }
+    }
+}
+
+impl Drop for LockedFrontBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            gbm_sys::gbm_surface_release_buffer(self.surface, self.raw_bo());
+        }
+    }
+}
+
+impl DrmPlanarBuffer for LockedFrontBuffer {
+    fn size(&self) -> (u32, u32) {
+        (self.width(), self.height())
+    }
+
+    fn format(&self) -> DrmFourcc {
+        DrmFourcc::try_from(unsafe { gbm_sys::gbm_bo_get_format(self.raw_bo()) })
+            .expect("libgbm returned invalid buffer format")
+    }
+
+    fn modifier(&self) -> Option<DrmModifier> {
+        Some(DrmModifier::from(unsafe {
+            gbm_sys::gbm_bo_get_modifier(self.raw_bo())
+        }))
+    }
+
+    fn pitches(&self) -> [u32; 4] {
+        let num = self.plane_count();
+        [
+            unsafe { gbm_sys::gbm_bo_get_stride_for_plane(self.raw_bo(), 0) },
+            if num > 1 {
+                unsafe { gbm_sys::gbm_bo_get_stride_for_plane(self.raw_bo(), 1) }
+            } else {
+                0
+            },
+            if num > 2 {
+                unsafe { gbm_sys::gbm_bo_get_stride_for_plane(self.raw_bo(), 2) }
+            } else {
+                0
+            },
+            if num > 3 {
+                unsafe { gbm_sys::gbm_bo_get_stride_for_plane(self.raw_bo(), 3) }
+            } else {
+                0
+            },
+        ]
+    }
+
+    fn handles(&self) -> [Option<BufferHandle>; 4] {
+        let num = self.plane_count();
+        [
+            Some(buffer_handle_for_plane(self.raw_bo(), 0)),
+            if num > 1 {
+                Some(buffer_handle_for_plane(self.raw_bo(), 1))
+            } else {
+                None
+            },
+            if num > 2 {
+                Some(buffer_handle_for_plane(self.raw_bo(), 2))
+            } else {
+                None
+            },
+            if num > 3 {
+                Some(buffer_handle_for_plane(self.raw_bo(), 3))
+            } else {
+                None
+            },
+        ]
+    }
+
+    fn offsets(&self) -> [u32; 4] {
+        let num = self.plane_count();
+        [
+            unsafe { gbm_sys::gbm_bo_get_offset(self.raw_bo(), 0) },
+            if num > 1 {
+                unsafe { gbm_sys::gbm_bo_get_offset(self.raw_bo(), 1) }
+            } else {
+                0
+            },
+            if num > 2 {
+                unsafe { gbm_sys::gbm_bo_get_offset(self.raw_bo(), 2) }
+            } else {
+                0
+            },
+            if num > 3 {
+                unsafe { gbm_sys::gbm_bo_get_offset(self.raw_bo(), 3) }
+            } else {
+                0
+            },
+        ]
+    }
+}
+
+fn buffer_handle_for_plane(bo: *mut gbm_sys::gbm_bo, plane: i32) -> BufferHandle {
+    let handle = unsafe { gbm_sys::gbm_bo_get_handle_for_plane(bo, plane).u32_ };
+    BufferHandle::from(NonZeroU32::new(handle).expect("libgbm returned zero BO handle"))
+}
+
+fn open_card(path: &str) -> Result<GbmDevice<Card>, Box<dyn std::error::Error>> {
+    let card = Card(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("open {path}: {e}"))?,
+    );
+    Ok(GbmDevice::new(card)?)
+}
+
+fn sorted_drm_card_paths() -> io::Result<Vec<String>> {
+    let mut paths = fs::read_dir("/dev/dri")?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("card"))
+        })
+        .filter_map(|path| path.to_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+
+    paths.sort();
+    Ok(paths)
+}
+
+fn open_display_card() -> Result<(String, GbmDevice<Card>), Box<dyn std::error::Error>> {
+    if let Ok(path) = std::env::var("SHLOG_DRM_CARD") {
+        let gbm = open_card(&path)?;
+        return Ok((path, gbm));
+    }
+
+    let mut errors = Vec::new();
+
+    for path in sorted_drm_card_paths()? {
+        match open_card(&path) {
+            Ok(gbm) if find_setup(&gbm).is_some() => return Ok((path, gbm)),
+            Ok(_) => errors.push(format!("{path}: no connected display setup")),
+            Err(e) => errors.push(format!("{path}: {e}")),
+        }
+    }
+
+    Err(format!("no usable DRM card found: {}", errors.join("; ")).into())
+}
+
+fn fourcc_string(format: u32) -> String {
+    let bytes = format.to_le_bytes();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn primary_plane_formats(dev: &impl ControlDevice, crtc_h: crtc::Handle) -> Vec<u32> {
+    let Ok(res) = dev.resource_handles() else {
+        return Vec::new();
+    };
+    let Ok(planes) = dev.plane_handles() else {
+        return Vec::new();
+    };
+
+    let mut formats = Vec::new();
+    for plane_h in planes {
+        let Ok(plane) = dev.get_plane(plane_h) else {
+            continue;
+        };
+        let possible = res.filter_crtcs(plane.possible_crtcs());
+        if !possible.contains(&crtc_h) {
+            continue;
+        }
+        eprintln!(
+            "plane {plane_h:?}: crtc={:?} fb={:?} possible_crtcs={possible:?} formats={:?}",
+            plane.crtc(),
+            plane.framebuffer(),
+            plane
+                .formats()
+                .iter()
+                .map(|&f| fourcc_string(f))
+                .collect::<Vec<_>>(),
+        );
+        for &format in plane.formats() {
+            if !formats.contains(&format) {
+                formats.push(format);
+            }
+        }
+    }
+
+    formats
+}
+
 // ---------------------------------------------------------------------------
 // DRM setup: find the first connected connector, its preferred mode, and a
 // compatible CRTC.
@@ -184,17 +585,54 @@ fn find_setup(dev: &impl ControlDevice) -> Option<(connector::Handle, Mode, crtc
         let Ok(conn) = dev.get_connector(conn_h, false) else {
             continue;
         };
+        eprintln!(
+            "connector {conn_h:?}: {:?}-{} state={:?} current_encoder={:?} encoders={:?}",
+            conn.interface(),
+            conn.interface_id(),
+            conn.state(),
+            conn.current_encoder(),
+            conn.encoders(),
+        );
         if conn.state() != connector::State::Connected {
             continue;
         }
         let Some(&mode) = conn.modes().first() else {
             continue;
         };
+
+        if let Some(enc_h) = conn.current_encoder()
+            && let Ok(enc) = dev.get_encoder(enc_h)
+        {
+            let possible = res.filter_crtcs(enc.possible_crtcs());
+            eprintln!(
+                "  current encoder {enc_h:?}: current_crtc={:?} possible_crtcs={possible:?}",
+                enc.crtc(),
+            );
+            if let Some(crtc_h) = enc.crtc()
+                && possible.contains(&crtc_h)
+            {
+                eprintln!(
+                    "  selected current path: connector={conn_h:?} encoder={enc_h:?} crtc={crtc_h:?} mode={}",
+                    mode.name().to_string_lossy(),
+                );
+                return Some((conn_h, mode, crtc_h));
+            }
+        }
+
         for &enc_h in conn.encoders() {
             let Ok(enc) = dev.get_encoder(enc_h) else {
                 continue;
             };
-            if let Some(&crtc_h) = res.filter_crtcs(enc.possible_crtcs()).first() {
+            let possible = res.filter_crtcs(enc.possible_crtcs());
+            eprintln!(
+                "  encoder {enc_h:?}: current_crtc={:?} possible_crtcs={possible:?}",
+                enc.crtc(),
+            );
+            if let Some(&crtc_h) = possible.first() {
+                eprintln!(
+                    "  selected possible path: connector={conn_h:?} encoder={enc_h:?} crtc={crtc_h:?} mode={}",
+                    mode.name().to_string_lossy(),
+                );
                 return Some((conn_h, mode, crtc_h));
             }
         }
@@ -332,8 +770,8 @@ fn create_atlas(scale: usize) -> FontAtlas {
                 advance_x: cell,
                 u0: x as f32 / w as f32,
                 u1: (x + cell) as f32 / w as f32,
-                v0: y as f32 / h as f32,
-                v1: (y + cell) as f32 / h as f32,
+                v0: (y as f32 + 0.5) / h as f32,
+                v1: ((y + cell) as f32 - 0.5) / h as f32,
             },
         );
     }
@@ -346,11 +784,56 @@ fn create_atlas(scale: usize) -> FontAtlas {
     }
 }
 
-fn framebuffer_depth(format: Format) -> u32 {
-    match format {
-        Format::Argb8888 | Format::Abgr8888 | Format::Rgba8888 | Format::Bgra8888 => 32,
-        _ => 24,
+fn choose_egl_config(
+    egl_api: &egl::Instance<egl::Static>,
+    disp: egl::Display,
+    supported_scanout_formats: &[u32],
+) -> Result<(egl::Config, Format), Box<dyn std::error::Error>> {
+    let attribs = [
+        egl::SURFACE_TYPE,
+        egl::WINDOW_BIT,
+        egl::RENDERABLE_TYPE,
+        egl::OPENGL_ES2_BIT,
+        egl::RED_SIZE,
+        8,
+        egl::GREEN_SIZE,
+        8,
+        egl::BLUE_SIZE,
+        8,
+        egl::NONE,
+    ];
+
+    let mut configs = Vec::with_capacity(64);
+    egl_api
+        .choose_config(disp, &attribs, &mut configs)
+        .map_err(|e| format!("eglChooseConfig: {e}"))?;
+
+    let mut fallback = None;
+    for cfg in configs {
+        let native_visual = egl_api
+            .get_config_attrib(disp, cfg, egl::NATIVE_VISUAL_ID)
+            .map_err(|e| format!("eglGetConfigAttrib(NATIVE_VISUAL_ID): {e}"))?;
+        let native_visual = native_visual as u32;
+        let Ok(format) = Format::try_from(native_visual) else {
+            eprintln!(
+                "egl config ignored: unsupported native visual 0x{native_visual:08x} ({})",
+                fourcc_string(native_visual),
+            );
+            continue;
+        };
+
+        eprintln!(
+            "egl config candidate: native visual {format:?} ({})",
+            fourcc_string(native_visual),
+        );
+
+        if supported_scanout_formats.contains(&native_visual) {
+            return Ok((cfg, format));
+        }
+        fallback.get_or_insert((cfg, format));
     }
+
+    fallback.ok_or_else(|| "eglChooseConfig: no usable config".into())
 }
 
 fn wait_for_page_flip(
@@ -366,6 +849,36 @@ fn wait_for_page_flip(
             }
         }
     }
+}
+
+fn restore_crtc(
+    dev: &impl ControlDevice,
+    crtc_h: crtc::Handle,
+    conn_h: connector::Handle,
+    original: &crtc::Info,
+    current_bo: &mut Option<(framebuffer::Handle, LockedFrontBuffer)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let conns = if original.mode().is_some() {
+        &[conn_h][..]
+    } else {
+        &[][..]
+    };
+
+    dev.set_crtc(
+        crtc_h,
+        original.framebuffer(),
+        original.position(),
+        conns,
+        original.mode(),
+    )
+    .map_err(|e| format!("restore set_crtc: {e}"))?;
+
+    if let Some((fb, _bo)) = current_bo.take() {
+        dev.destroy_framebuffer(fb)
+            .map_err(|e| format!("restore destroy_framebuffer: {e}"))?;
+    }
+
+    Ok(())
 }
 
 unsafe fn compile_shader(
@@ -414,22 +927,50 @@ unsafe fn link_program(
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut keyboard = find_keyboard()?;
-    set_evdev_nonblocking(&keyboard)?;
-    let mut input = String::new();
+    let sock_path = std::env::var("GREETD_SOCK")
+        .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "$GREETD_SOCK is not set"))?;
+
+    let (greetd_tx, greetd_rx) = spawn_greetd_worker(sock_path);
+    let mut keyboards = find_keyboards().map_err(|e| format!("find_keyboards: {e}"))?;
+    for keyboard in &keyboards {
+        set_evdev_nonblocking(keyboard).map_err(|e| format!("set_evdev_nonblocking: {e}"))?;
+    }
+    let mut kbd_in = KeyboardInput::new(std::mem::take(&mut keyboards));
+
+    //    let mut input = String::new();
 
     // --- DRM / GBM ---
-    let card = Card(
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/dri/card0")?,
-    );
-    let gbm = GbmDevice::new(card)?;
+    let (card_path, gbm) = open_display_card()?;
+    match gbm.set_client_capability(drm::ClientCapability::UniversalPlanes, true) {
+        Ok(()) => eprintln!("drm client cap: universal planes enabled"),
+        Err(e) => eprintln!("drm client cap: universal planes unavailable: {e}"),
+    }
+    match gbm.acquire_master_lock() {
+        Ok(()) => eprintln!("drm master: acquired explicitly on {card_path}"),
+        Err(e) => eprintln!("drm master: explicit acquire failed on {card_path}: {e}"),
+    }
 
     let (conn_h, mode, crtc_h) = find_setup(&gbm).expect("no connected display found");
+    let original_crtc = gbm
+        .get_crtc(crtc_h)
+        .map_err(|e| format!("get_crtc before modeset: {e}"))?;
     let (w, h) = (mode.size().0 as u32, mode.size().1 as u32);
-    eprintln!("mode: {w}x{h}");
+    eprintln!(
+        "drm setup: connector={conn_h:?} crtc={crtc_h:?} mode={} {w}x{h} original_fb={:?} original_mode={:?}",
+        mode.name().to_string_lossy(),
+        original_crtc.framebuffer(),
+        original_crtc
+            .mode()
+            .map(|m| m.name().to_string_lossy().into_owned()),
+    );
+    let scanout_formats = primary_plane_formats(&gbm, crtc_h);
+    eprintln!(
+        "scanout format candidates for {crtc_h:?}: {:?}",
+        scanout_formats
+            .iter()
+            .map(|&f| fourcc_string(f))
+            .collect::<Vec<_>>(),
+    );
 
     // --- EGL ---
     let egl_api = egl::Instance::new(egl::Static);
@@ -473,31 +1014,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bind_api(egl::OPENGL_ES_API)
         .map_err(|e| format!("eglBindAPI: {e}"))?;
 
-    let cfg = egl_api
-        .choose_first_config(
-            disp,
-            &[
-                egl::SURFACE_TYPE,
-                egl::WINDOW_BIT,
-                egl::RENDERABLE_TYPE,
-                egl::OPENGL_ES2_BIT,
-                egl::RED_SIZE,
-                8,
-                egl::GREEN_SIZE,
-                8,
-                egl::BLUE_SIZE,
-                8,
-                egl::NONE,
-            ],
-        )
-        .map_err(|e| format!("eglChooseConfig: {e}"))?
-        .ok_or("eglChooseConfig: no matching config")?;
-    let native_visual = egl_api
-        .get_config_attrib(disp, cfg, egl::NATIVE_VISUAL_ID)
-        .map_err(|e| format!("eglGetConfigAttrib(NATIVE_VISUAL_ID): {e}"))?;
-    let gbm_format = Format::try_from(native_visual as u32).map_err(|_| {
-        format!("egl config returned unsupported native visual 0x{native_visual:08x}")
-    })?;
+    let (cfg, gbm_format) = choose_egl_config(&egl_api, disp, &scanout_formats)?;
     eprintln!("egl config ok: native visual {gbm_format:?}");
 
     let gbm_surf = gbm
@@ -505,7 +1022,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             w,
             h,
             gbm_format,
-            BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING | BufferObjectFlags::LINEAR,
+            BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
         )
         .map_err(|e| format!("gbm create_surface: {e}"))?;
     eprintln!("gbm surface ok");
@@ -546,145 +1063,130 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let bg_scene = BackgroundScene::new(&gl, w, h)?;
-    let text_scene = TextScene::new(&gl, 9)?;
+    let text_scene = TextScene::new(&gl, 7)?;
     let post_scene = PostprocScene::new(&gl)?;
 
     // --- Display via DRM ---
     let start = Instant::now();
-    let mut current_bo: Option<(framebuffer::Handle, BufferObject<()>)> = None;
+    let mut current_bo: Option<(framebuffer::Handle, LockedFrontBuffer)> = None;
     let mut logged_bo = false;
 
-    eprintln!("displaying animated shader — Ctrl-C to exit");
-    loop {
-        match keyboard.fetch_events() {
-            Ok(events) => {
-                for ev in events {
-                    if ev.event_type() != EventType::KEY {
-                        continue;
-                    }
-                    let press_or_hold = ev.value() == 2 || ev.value() == 1;
+    // app state
+    let mut state = LoginState::default();
+    let mut this_state = Instant::now();
+    let target_frame_time = Duration::from_millis(16);
 
-                    let key = Key(ev.code());
-                    match (key, press_or_hold) {
-                        (Key::KEY_M, true) => {
-                            input.push('m');
-                        }
-                        (Key::KEY_I, true) => {
-                            input.push('i');
-                        }
-                        (Key::KEY_C, true) => {
-                            input.push('c');
-                        }
-                        (Key::KEY_H, true) => {
-                            input.push('h');
-                        }
-                        (Key::KEY_A, true) => {
-                            input.push('a');
-                        }
-                        (Key::KEY_E, true) => {
-                            input.push('e');
-                        }
-                        (Key::KEY_L, true) => {
-                            input.push('l');
-                        }
-                        (Key::KEY_B, true) => {
-                            input.push('b');
-                        }
-                        (Key::KEY_D, true) => {
-                            input.push('d');
-                        }
-                        (Key::KEY_F, true) => {
-                            input.push('f');
-                        }
-                        (Key::KEY_G, true) => {
-                            input.push('g');
-                        }
-                        (Key::KEY_J, true) => {
-                            input.push('j');
-                        }
-                        (Key::KEY_K, true) => {
-                            input.push('k');
-                        }
-                        (Key::KEY_N, true) => {
-                            input.push('n');
-                        }
-                        (Key::KEY_O, true) => {
-                            input.push('o');
-                        }
-                        (Key::KEY_P, true) => {
-                            input.push('p');
-                        }
-                        (Key::KEY_Q, true) => {
-                            input.push('q');
-                        }
-                        (Key::KEY_R, true) => {
-                            input.push('r');
-                        }
-                        (Key::KEY_S, true) => {
-                            input.push('s');
-                        }
-                        (Key::KEY_T, true) => {
-                            input.push('t');
-                        }
-                        (Key::KEY_U, true) => {
-                            input.push('u');
-                        }
-                        (Key::KEY_V, true) => {
-                            input.push('v');
-                        }
-                        (Key::KEY_W, true) => {
-                            input.push('w');
-                        }
-                        (Key::KEY_X, true) => {
-                            input.push('x');
-                        }
-                        (Key::KEY_Y, true) => {
-                            input.push('y');
-                        }
-                        (Key::KEY_Z, true) => {
-                            input.push('z');
-                        }
-                        (Key::KEY_SPACE, true) => {
-                            input.push(' ');
-                        }
-                        (Key::KEY_ENTER, true) => {
-                            input.push('\n');
-                        }
-                        (Key::KEY_8, true) => {
-                            input.push('*');
-                        }
-                        (Key::KEY_BACKSPACE, true) => {
-                            input.pop();
-                        }
-                        _ => {}
-                    }
+    eprintln!("displaying animated shader — Ctrl-C to exit");
+    'main: loop {
+        let frame_start = Instant::now();
+
+        while let Ok(result) = greetd_rx.try_recv() {
+            let ev = match result {
+                GreetdResult::AuthAccepted => LoginEvent::AuthAccepted,
+                GreetdResult::AuthFailure(e) => {
+                    eprintln!("greetd login failed: {e}");
+                    LoginEvent::AuthFailure
                 }
+                GreetdResult::SessionStarted => LoginEvent::SessionStarted,
+                GreetdResult::SessionFailed(e) => {
+                    eprintln!("greetd session failed: {e}");
+                    LoginEvent::SessionFailure
+                }
+            };
+
+            let transition = state.update(ev);
+            state = transition.state;
+            if transition.reset_timer {
+                this_state = Instant::now();
             }
-            _ => {}
+            if let Some(LoginAction::Exit) = transition.action {
+                restore_crtc(&gbm, crtc_h, conn_h, &original_crtc, &mut current_bo)?;
+                break 'main Ok(());
+            }
         }
 
+        if let Ok(events) = kbd_in.read_events() {
+            for ev in events {
+                let transition = state.update(ev);
+                state = transition.state;
+                if transition.reset_timer {
+                    this_state = Instant::now();
+                }
+                match transition.action {
+                    Some(LoginAction::Exit) => {
+                        restore_crtc(&gbm, crtc_h, conn_h, &original_crtc, &mut current_bo)?;
+                        break 'main Ok(());
+                    }
+                    Some(LoginAction::Authenticate { username, password }) => {
+                        if let Err(e) =
+                            greetd_tx.send(GreetdCommand::Authenticate { username, password })
+                        {
+                            eprintln!("greetd worker stopped: {e}");
+                            let transition = state.update(LoginEvent::AuthFailure);
+                            state = transition.state;
+                            if transition.reset_timer {
+                                this_state = Instant::now();
+                            }
+                        }
+                    }
+                    None => continue,
+                }
+            }
+        }
+
+        if this_state.elapsed() > Duration::from_millis(300) {
+            let transition = state.update(LoginEvent::TimerOver);
+            state = transition.state;
+            if transition.reset_timer {
+                this_state = Instant::now();
+            }
+            if let Some(LoginAction::Exit) = transition.action {
+                restore_crtc(&gbm, crtc_h, conn_h, &original_crtc, &mut current_bo)?;
+                break 'main Ok(());
+            }
+        }
+
+        let msg = match &state {
+            LoginState::UsernameInput { username } => format!("Hello {}_", username),
+            LoginState::PasswordInput { username, password } => format!(
+                "Hello {}\n{}_",
+                username,
+                password.chars().map(|_| '*').collect::<String>()
+            ),
+            LoginState::Authenticating { username } => {
+                format!("Hello {}\nauthenticating", username)
+            }
+            LoginState::StartingSession { username } => {
+                format!("Hello {}\nstarting session", username)
+            }
+            LoginState::Failure { username } => format!("Hello {}\nlogin failed", username),
+            LoginState::Success => format!(""),
+        };
+
         let t = start.elapsed().as_secs_f32();
+        let state_time = this_state.elapsed().as_secs_f32();
         bg_scene.draw(&gl);
-        text_scene.draw(
+        text_scene.draw(&gl, bg_scene.scene_fbo, &msg, w, h, t)?;
+        post_scene.draw(
             &gl,
-            bg_scene.scene_fbo,
-            &format!("Hello {}_", input),
-            w,
-            h,
+            bg_scene.scene_tex,
+            w as f32,
+            h as f32,
             t,
+            state.visual_state(),
+            state_time,
         )?;
-        post_scene.draw(&gl, bg_scene.scene_tex, w as f32, h as f32, t)?;
 
         egl_api
             .swap_buffers(disp, surf)
             .map_err(|e| format!("eglSwapBuffers: {e}"))?;
 
-        let bo = unsafe { gbm_surf.lock_front_buffer() }
+        let bo = unsafe { LockedFrontBuffer::lock(&gbm_surf) }
             .map_err(|e| format!("lock_front_buffer: {e}"))?;
 
         if !logged_bo {
             eprintln!(
-                "bo: {:?}x{:?} format={:?} stride={:?} modifier={:?}",
+                "bo: {}x{} format={:?} stride={} modifier={:?}",
                 bo.width(),
                 bo.height(),
                 bo.format(),
@@ -695,10 +1197,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let fb = gbm
-            .add_framebuffer(&bo, framebuffer_depth(gbm_format), 32)
-            .map_err(|e| format!("add_framebuffer: {e}"))?;
+            .add_planar_framebuffer(&bo, FbCmd2Flags::MODIFIERS)
+            .map_err(|e| format!("add_planar_framebuffer: {e}"))?;
 
         if current_bo.is_none() {
+            eprintln!(
+                "set_crtc: connector={conn_h:?} crtc={crtc_h:?} fb={fb:?} mode={} {}x{}",
+                mode.name().to_string_lossy(),
+                mode.size().0,
+                mode.size().1,
+            );
             gbm.set_crtc(crtc_h, Some(fb), (0, 0), &[conn_h], Some(mode))
                 .map_err(|e| format!("set_crtc: {e}"))?;
             current_bo = Some((fb, bo));
@@ -712,6 +1220,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some((old_fb, _old_bo)) = current_bo.replace((fb, bo)) {
             gbm.destroy_framebuffer(old_fb)
                 .map_err(|e| format!("destroy_framebuffer: {e}"))?;
+        }
+
+        let frame_time = frame_start.elapsed();
+        if frame_time < target_frame_time {
+            thread::sleep(target_frame_time - frame_time);
         }
     }
 }
@@ -1039,6 +1552,8 @@ struct PostprocScene {
     time_loc: glow::UniformLocation,
     aspect_loc: glow::UniformLocation,
     resolution_loc: glow::UniformLocation,
+    login_state_loc: glow::UniformLocation,
+    state_time_loc: glow::UniformLocation,
     pos: u32,
     uv: u32,
 }
@@ -1077,6 +1592,12 @@ impl PostprocScene {
             let resolution_loc = gl
                 .get_uniform_location(prog, "u_resolution")
                 .expect("u_resolution");
+            let login_state_loc = gl
+                .get_uniform_location(prog, "u_login_state")
+                .expect("u_login_state");
+            let state_time_loc = gl
+                .get_uniform_location(prog, "u_state_time")
+                .expect("u_state_time");
             Self {
                 pos,
                 uv,
@@ -1086,6 +1607,8 @@ impl PostprocScene {
                 time_loc,
                 aspect_loc,
                 resolution_loc,
+                login_state_loc,
+                state_time_loc,
             }
         };
         Ok(pp_scene)
@@ -1098,6 +1621,8 @@ impl PostprocScene {
         w: f32,
         h: f32,
         t: f32,
+        login_state: i32,
+        state_time: f32,
     ) -> Result<(), Box<dyn std::error::Error>> {
         unsafe {
             gl.viewport(0, 0, w as i32, h as i32);
@@ -1117,9 +1642,376 @@ impl PostprocScene {
             gl.uniform_2_f32(Some(&self.resolution_loc), w, h);
 
             gl.uniform_1_f32(Some(&self.time_loc), t);
+            gl.uniform_1_i32(Some(&self.login_state_loc), login_state);
+            gl.uniform_1_f32(Some(&self.state_time_loc), state_time);
             gl.clear(COLOR_BUFFER_BIT);
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         }
         Ok(())
+    }
+}
+
+enum LoginState {
+    UsernameInput { username: String },
+    PasswordInput { username: String, password: String },
+    Authenticating { username: String },
+    StartingSession { username: String },
+    Failure { username: String },
+    Success,
+}
+
+enum LoginEvent {
+    Char(char),
+    Delete,
+    Submit,
+    PreviousField,
+    AuthAccepted,
+    AuthFailure,
+    SessionStarted,
+    SessionFailure,
+    TimerOver,
+}
+
+enum LoginAction {
+    Authenticate { username: String, password: String },
+    Exit,
+}
+
+struct LoginTransition {
+    state: LoginState,
+    action: Option<LoginAction>,
+    reset_timer: bool,
+}
+
+impl LoginTransition {
+    fn stay(state: LoginState) -> Self {
+        Self {
+            state,
+            action: None,
+            reset_timer: false,
+        }
+    }
+
+    fn change(state: LoginState) -> Self {
+        Self {
+            state,
+            action: None,
+            reset_timer: true,
+        }
+    }
+
+    fn change_with_action(state: LoginState, action: LoginAction) -> Self {
+        Self {
+            state,
+            action: Some(action),
+            reset_timer: true,
+        }
+    }
+}
+
+impl Default for LoginState {
+    fn default() -> Self {
+        Self::UsernameInput {
+            username: String::with_capacity(256),
+        }
+    }
+}
+
+impl LoginState {
+    fn visual_state(&self) -> i32 {
+        match self {
+            LoginState::UsernameInput { .. } => 0,
+            LoginState::PasswordInput { .. } => 1,
+            LoginState::Authenticating { .. } => 2,
+            LoginState::StartingSession { .. } => 3,
+            LoginState::Failure { .. } => 4,
+            LoginState::Success => 5,
+        }
+    }
+
+    fn update(self, ev: LoginEvent) -> LoginTransition {
+        match (self, ev) {
+            (LoginState::UsernameInput { mut username }, LoginEvent::Char(c)) => {
+                username.push(c);
+                LoginTransition::stay(LoginState::UsernameInput { username })
+            }
+            (LoginState::UsernameInput { mut username }, LoginEvent::Delete) => {
+                username.pop();
+                LoginTransition::stay(LoginState::UsernameInput { username })
+            }
+            (LoginState::UsernameInput { username }, LoginEvent::Submit)
+                if !username.is_empty() =>
+            {
+                LoginTransition::change(LoginState::PasswordInput {
+                    username,
+                    password: String::new(),
+                })
+            }
+            (
+                LoginState::PasswordInput {
+                    username,
+                    mut password,
+                },
+                LoginEvent::Char(c),
+            ) => {
+                password.push(c);
+                LoginTransition::stay(LoginState::PasswordInput { username, password })
+            }
+            (
+                LoginState::PasswordInput {
+                    username,
+                    mut password,
+                },
+                LoginEvent::Delete,
+            ) => {
+                password.pop();
+                LoginTransition::stay(LoginState::PasswordInput { username, password })
+            }
+            (LoginState::PasswordInput { username, password }, LoginEvent::Submit) => {
+                LoginTransition::change_with_action(
+                    LoginState::Authenticating {
+                        username: username.clone(),
+                    },
+                    LoginAction::Authenticate { username, password },
+                )
+            }
+            (
+                LoginState::PasswordInput {
+                    username,
+                    password: _,
+                },
+                LoginEvent::PreviousField,
+            ) => LoginTransition::change(LoginState::UsernameInput { username }),
+            (LoginState::Authenticating { username }, LoginEvent::AuthAccepted) => {
+                LoginTransition::change(LoginState::StartingSession { username })
+            }
+            (LoginState::StartingSession { username: _ }, LoginEvent::SessionStarted) => {
+                LoginTransition::change(LoginState::Success)
+            }
+            (LoginState::Authenticating { username }, LoginEvent::AuthFailure) => {
+                LoginTransition::change(LoginState::Failure { username })
+            }
+            (LoginState::StartingSession { username }, LoginEvent::SessionFailure) => {
+                LoginTransition::change(LoginState::Failure { username })
+            }
+            (LoginState::Failure { username }, LoginEvent::Char(c)) => {
+                let password = String::from(c);
+                LoginTransition::change(LoginState::PasswordInput { username, password })
+            }
+            (LoginState::Failure { username }, LoginEvent::PreviousField) => {
+                LoginTransition::change(LoginState::UsernameInput { username })
+            }
+            (LoginState::Success, LoginEvent::TimerOver) => {
+                LoginTransition::change_with_action(LoginState::Success, LoginAction::Exit)
+            }
+            (s, _) => LoginTransition::stay(s),
+        }
+    }
+}
+
+struct KeyboardInput {
+    keyboards: Vec<EvDevice>,
+    shift: bool,
+    caps_lock: bool,
+}
+
+impl KeyboardInput {
+    fn new(keyboards: Vec<EvDevice>) -> Self {
+        let caps_lock = keyboards
+            .iter()
+            .any(|keyboard| {
+                keyboard
+                    .get_led_state()
+                    .is_ok_and(|leds| leds.contains(evdev::LedType::LED_CAPSL))
+            });
+
+        Self {
+            keyboards,
+            shift: false,
+            caps_lock,
+        }
+    }
+
+    fn read_events(&mut self) -> io::Result<Vec<LoginEvent>> {
+        let mut login_events = Vec::new();
+
+        for idx in 0..self.keyboards.len() {
+            let key_events = match self.keyboards[idx].fetch_events() {
+                Ok(events) => events
+                    .filter(|ev| ev.event_type() == EventType::KEY)
+                    .map(|ev| (Key(ev.code()), ev.value()))
+                    .collect::<Vec<_>>(),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) if e.raw_os_error() == Some(libc::ENODEV) => {
+                    eprintln!("keyboard disappeared: {e}");
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            for (key, value) in key_events {
+                self.update_modifiers(key, value);
+
+                if value == 0 {
+                    continue;
+                }
+
+                if let Some(login_event) = Self::map_key(key, self.shift, self.caps_lock) {
+                    login_events.push(login_event);
+                }
+            }
+        }
+
+        Ok(login_events)
+    }
+
+    fn update_modifiers(&mut self, key: Key, value: i32) {
+        match key {
+            Key::KEY_LEFTSHIFT | Key::KEY_RIGHTSHIFT => {
+                self.shift = value != 0;
+            }
+            Key::KEY_CAPSLOCK if value == 1 => {
+                self.caps_lock = !self.caps_lock;
+            }
+            _ => {}
+        }
+    }
+
+    fn map_key(key: Key, shift: bool, caps_lock: bool) -> Option<LoginEvent> {
+        match key {
+            Key::KEY_ENTER => Some(LoginEvent::Submit),
+            Key::KEY_KPENTER => Some(LoginEvent::Submit),
+            Key::KEY_BACKSPACE => Some(LoginEvent::Delete),
+            Key::KEY_UP => Some(LoginEvent::PreviousField),
+            Key::KEY_ESC => Some(LoginEvent::PreviousField),
+            Key::KEY_SPACE => Some(LoginEvent::Char(' ')),
+            key => Self::map_printable_key(key, shift, caps_lock).map(LoginEvent::Char),
+        }
+    }
+
+    fn map_printable_key(key: Key, shift: bool, caps_lock: bool) -> Option<char> {
+        if let Some(c) = Self::map_letter_key(key) {
+            let upper = shift ^ caps_lock;
+            return Some(if upper { c.to_ascii_uppercase() } else { c });
+        }
+
+        let c = match key {
+            Key::KEY_1 => {
+                if shift { '!' } else { '1' }
+            }
+            Key::KEY_2 => {
+                if shift { '@' } else { '2' }
+            }
+            Key::KEY_3 => {
+                if shift { '#' } else { '3' }
+            }
+            Key::KEY_4 => {
+                if shift { '$' } else { '4' }
+            }
+            Key::KEY_5 => {
+                if shift { '%' } else { '5' }
+            }
+            Key::KEY_6 => {
+                if shift { '^' } else { '6' }
+            }
+            Key::KEY_7 => {
+                if shift { '&' } else { '7' }
+            }
+            Key::KEY_8 => {
+                if shift { '*' } else { '8' }
+            }
+            Key::KEY_9 => {
+                if shift { '(' } else { '9' }
+            }
+            Key::KEY_0 => {
+                if shift { ')' } else { '0' }
+            }
+            Key::KEY_MINUS => {
+                if shift { '_' } else { '-' }
+            }
+            Key::KEY_EQUAL => {
+                if shift { '+' } else { '=' }
+            }
+            Key::KEY_LEFTBRACE => {
+                if shift { '{' } else { '[' }
+            }
+            Key::KEY_RIGHTBRACE => {
+                if shift { '}' } else { ']' }
+            }
+            Key::KEY_BACKSLASH => {
+                if shift { '|' } else { '\\' }
+            }
+            Key::KEY_SEMICOLON => {
+                if shift { ':' } else { ';' }
+            }
+            Key::KEY_APOSTROPHE => {
+                if shift { '"' } else { '\'' }
+            }
+            Key::KEY_GRAVE => {
+                if shift { '~' } else { '`' }
+            }
+            Key::KEY_COMMA => {
+                if shift { '<' } else { ',' }
+            }
+            Key::KEY_DOT => {
+                if shift { '>' } else { '.' }
+            }
+            Key::KEY_SLASH => {
+                if shift { '?' } else { '/' }
+            }
+            Key::KEY_KP0 => '0',
+            Key::KEY_KP1 => '1',
+            Key::KEY_KP2 => '2',
+            Key::KEY_KP3 => '3',
+            Key::KEY_KP4 => '4',
+            Key::KEY_KP5 => '5',
+            Key::KEY_KP6 => '6',
+            Key::KEY_KP7 => '7',
+            Key::KEY_KP8 => '8',
+            Key::KEY_KP9 => '9',
+            Key::KEY_KPMINUS => '-',
+            Key::KEY_KPPLUS => '+',
+            Key::KEY_KPASTERISK => '*',
+            Key::KEY_KPSLASH => '/',
+            Key::KEY_KPDOT => '.',
+            _ => return None,
+        };
+
+        Some(c)
+    }
+
+    fn map_letter_key(key: Key) -> Option<char> {
+        const LETTERS: &[(Key, char)] = &[
+            (Key::KEY_A, 'a'),
+            (Key::KEY_B, 'b'),
+            (Key::KEY_C, 'c'),
+            (Key::KEY_D, 'd'),
+            (Key::KEY_E, 'e'),
+            (Key::KEY_F, 'f'),
+            (Key::KEY_G, 'g'),
+            (Key::KEY_H, 'h'),
+            (Key::KEY_I, 'i'),
+            (Key::KEY_J, 'j'),
+            (Key::KEY_K, 'k'),
+            (Key::KEY_L, 'l'),
+            (Key::KEY_M, 'm'),
+            (Key::KEY_N, 'n'),
+            (Key::KEY_O, 'o'),
+            (Key::KEY_P, 'p'),
+            (Key::KEY_Q, 'q'),
+            (Key::KEY_R, 'r'),
+            (Key::KEY_S, 's'),
+            (Key::KEY_T, 't'),
+            (Key::KEY_U, 'u'),
+            (Key::KEY_V, 'v'),
+            (Key::KEY_W, 'w'),
+            (Key::KEY_X, 'x'),
+            (Key::KEY_Y, 'y'),
+            (Key::KEY_Z, 'z'),
+        ];
+
+        LETTERS
+            .iter()
+            .find_map(|(letter_key, c)| (*letter_key == key).then_some(*c))
     }
 }

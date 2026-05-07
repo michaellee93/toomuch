@@ -1,0 +1,30 @@
+[package]
+name = "shlog"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "shlog"
+path = "src/main.rs"
+
+[[bin]]
+name = "greet"
+path = "src/bin/greet.rs"
+
+[[bin]]
+name = "fbdraw"
+path = "src/bin/fbdraw.rs"
+
+[dependencies]
+drm = "0.11"
+evdev = "0.12"
+font8x8 = "0.2"
+gbm = { version = "0.14", features = ["drm-support"] }
+gbm-sys = "0.3"
+glow = "0.13"
+khronos-egl = { version = "6.0.0", features = ["static"] }
+libc = "0.2"
+minifb = "0.25"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
