@@ -1,10 +1,10 @@
-use shlog::greetd_client::{GreetdCommand, GreetdResult, spawn_greetd_worker};
-use shlog::keyboard::{KeyboardInput, find_keyboards, set_evdev_nonblocking};
-use shlog::login::{LoginAction, LoginApp, LoginEvent};
 use std::io;
+use toomuch::greetd_client::{GreetdCommand, GreetdResult, spawn_greetd_worker};
+use toomuch::keyboard::{KeyboardInput, find_keyboards, set_evdev_nonblocking};
+use toomuch::login::{LoginAction, LoginApp, LoginEvent};
 
-use shlog::display::native::DrmDisplay;
-use shlog::scene::Scene;
+use toomuch::display::native::DrmDisplay;
+use toomuch::scene::Scene;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sock_path = std::env::var("GREETD_SOCK")
@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut display = DrmDisplay::new()?;
     let (w, h) = display.size();
-    let cfg = shlog::Config::from_toml_file("./config.toml").unwrap_or_default();
+    let cfg = toomuch::Config::from_toml_file("./config.toml").unwrap_or_default();
 
     let scene;
     {

@@ -1,7 +1,7 @@
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 
-use shlog::{AuthMessageType, ErrorType, Request, Response, recv, send};
+use toomuch::{AuthMessageType, ErrorType, Request, Response, recv, send};
 
 const DEFAULT_SOCK: &str = "/tmp/greetd-fake.sock";
 

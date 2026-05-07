@@ -486,7 +486,7 @@ fn sorted_drm_card_paths() -> io::Result<Vec<String>> {
 }
 
 fn open_display_card() -> Result<(String, GbmDevice<Card>), Box<dyn std::error::Error>> {
-    if let Ok(path) = std::env::var("SHLOG_DRM_CARD") {
+    if let Ok(path) = std::env::var("TOOMUCH_DRM_CARD") {
         let gbm = open_card(&path)?;
         return Ok((path, gbm));
     }

@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 
-use shlog::{AuthMessageType, Request, Response, recv, send};
+use toomuch::{AuthMessageType, Request, Response, recv, send};
 
 fn prompt(label: &str) -> String {
     print!("{label}");

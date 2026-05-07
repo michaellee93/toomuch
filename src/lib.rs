@@ -1,15 +1,25 @@
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io;
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::{Read, Write};
+#[cfg(not(target_arch = "wasm32"))]
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+#[cfg(not(target_arch = "wasm32"))]
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod display;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod greetd_client;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod keyboard;
 pub mod login;
 pub mod scene;
+#[cfg(target_arch = "wasm32")]
+pub mod web;
 
 const POST_FSHAD: &str = "precision highp float; \
              uniform sampler2D u_tex; \
@@ -107,6 +117,7 @@ pub enum AuthMessageType {
     Error,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn send<T: Serialize>(stream: &mut UnixStream, msg: &T) -> io::Result<()> {
     let payload = serde_json::to_vec(msg).expect("serialisation failed");
     let len = payload.len() as u32;
@@ -114,6 +125,7 @@ pub fn send<T: Serialize>(stream: &mut UnixStream, msg: &T) -> io::Result<()> {
     stream.write_all(&payload)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn recv<T: DeserializeOwned>(stream: &mut UnixStream) -> io::Result<T> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;

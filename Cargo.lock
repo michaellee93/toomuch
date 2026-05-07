@@ -782,24 +782,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
-name = "shlog"
-version = "0.1.0"
-dependencies = [
- "drm",
- "evdev",
- "font8x8",
- "gbm",
- "gbm-sys",
- "glow",
- "khronos-egl",
- "libc",
- "minifb",
- "serde",
- "serde_json",
- "toml",
-]
-
-[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -910,6 +892,27 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
+name = "toomuch"
+version = "0.1.0"
+dependencies = [
+ "drm",
+ "evdev",
+ "font8x8",
+ "gbm",
+ "gbm-sys",
+ "glow",
+ "js-sys",
+ "khronos-egl",
+ "libc",
+ "minifb",
+ "serde",
+ "serde_json",
+ "toml",
+ "wasm-bindgen",
+ "web-sys",
+]
 
 [[package]]
 name = "unicode-ident"

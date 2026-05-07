@@ -1,8 +1,14 @@
 use crate::{Config, InputConfig, PostConfig, login::LoginView};
 use font8x8::legacy::BASIC_LEGACY;
-use glow::{COLOR_BUFFER_BIT, HasContext, NativeBuffer, NativeProgram, NativeTexture};
+use glow::{COLOR_BUFFER_BIT, HasContext};
 use std::collections::HashMap;
 use std::fs;
+
+type GlBuffer = <glow::Context as HasContext>::Buffer;
+type GlFramebuffer = <glow::Context as HasContext>::Framebuffer;
+type GlProgram = <glow::Context as HasContext>::Program;
+type GlShader = <glow::Context as HasContext>::Shader;
+type GlTexture = <glow::Context as HasContext>::Texture;
 
 pub struct Scene {
     background: BackgroundScene,
@@ -164,7 +170,7 @@ unsafe fn compile_shader(
     gl: &glow::Context,
     kind: u32,
     source: &str,
-) -> Result<glow::Shader, Box<dyn std::error::Error>> {
+) -> Result<GlShader, Box<dyn std::error::Error>> {
     let shader = unsafe { gl.create_shader(kind)? };
     unsafe {
         gl.shader_source(shader, source);
@@ -182,9 +188,9 @@ unsafe fn compile_shader(
 
 unsafe fn link_program(
     gl: &glow::Context,
-    vs: glow::Shader,
-    fs: glow::Shader,
-) -> Result<glow::Program, Box<dyn std::error::Error>> {
+    vs: GlShader,
+    fs: GlShader,
+) -> Result<GlProgram, Box<dyn std::error::Error>> {
     let program = unsafe { gl.create_program()? };
     unsafe {
         gl.attach_shader(program, vs);
@@ -201,13 +207,39 @@ unsafe fn link_program(
     Ok(program)
 }
 
+unsafe fn check_framebuffer(gl: &glow::Context) -> Result<(), Box<dyn std::error::Error>> {
+    let status = unsafe { gl.check_framebuffer_status(glow::FRAMEBUFFER) };
+    if status != glow::FRAMEBUFFER_COMPLETE {
+        return Err(format!("framebuffer incomplete: status 0x{status:x}").into());
+    }
+    Ok(())
+}
+
+unsafe fn required_attrib(
+    gl: &glow::Context,
+    program: GlProgram,
+    name: &str,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    unsafe { gl.get_attrib_location(program, name) }
+        .ok_or_else(|| format!("missing shader attribute {name}").into())
+}
+
+unsafe fn required_uniform(
+    gl: &glow::Context,
+    program: GlProgram,
+    name: &str,
+) -> Result<glow::UniformLocation, Box<dyn std::error::Error>> {
+    unsafe { gl.get_uniform_location(program, name) }
+        .ok_or_else(|| format!("missing shader uniform {name}").into())
+}
+
 pub struct BackgroundScene {
-    vbo: glow::NativeBuffer,
-    scene_tex: glow::NativeTexture,
-    scene_fbo: glow::NativeFramebuffer,
+    vbo: GlBuffer,
+    scene_tex: GlTexture,
+    scene_fbo: GlFramebuffer,
     w: u32,
     h: u32,
-    scene_program: glow::NativeProgram,
+    scene_program: GlProgram,
     scene_uv: u32,
     scene_pos: u32,
 }
@@ -230,10 +262,10 @@ impl BackgroundScene {
         gl_FragColor = vec4(0.117647, 0.117647, 0.180392 + ((v_uv.x + u_time) / 10000.0) , 1.0); \
     }";
 
-    pub fn output_texture(&self) -> glow::NativeTexture {
+    pub fn output_texture(&self) -> GlTexture {
         self.scene_tex
     }
-    pub fn output_fbo(&self) -> glow::NativeFramebuffer {
+    pub fn output_fbo(&self) -> GlFramebuffer {
         self.scene_fbo
     }
 
@@ -258,6 +290,7 @@ impl BackgroundScene {
             // construct fb on the gpu now
             let scene_tex = gl.create_texture()?;
             gl.bind_texture(glow::TEXTURE_2D, Some(scene_tex));
+            let empty_pixels = vec![0u8; (w as usize) * (h as usize) * 4];
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
@@ -267,7 +300,7 @@ impl BackgroundScene {
                 0,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
-                None,
+                Some(&empty_pixels),
             );
             gl.tex_parameter_i32(
                 glow::TEXTURE_2D,
@@ -299,8 +332,7 @@ impl BackgroundScene {
                 Some(scene_tex),
                 0,
             );
-            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
-            assert_eq!(status, glow::FRAMEBUFFER_COMPLETE);
+            check_framebuffer(gl)?;
 
             let scene_vshad = compile_shader(&gl, glow::VERTEX_SHADER, BackgroundScene::BG_VSHAD)?;
             let scene_fshad =
@@ -309,10 +341,8 @@ impl BackgroundScene {
             gl.delete_shader(scene_vshad);
             gl.delete_shader(scene_fshad);
 
-            let scene_pos = gl
-                .get_attrib_location(scene_program, "a_pos")
-                .expect("a_pos");
-            let scene_uv = gl.get_attrib_location(scene_program, "a_uv").expect("a_uv");
+            let scene_pos = required_attrib(gl, scene_program, "a_pos")?;
+            let scene_uv = required_attrib(gl, scene_program, "a_uv")?;
             gl.enable_vertex_attrib_array(scene_pos);
             gl.vertex_attrib_pointer_f32(scene_pos, 2, glow::FLOAT, false, 16, 0);
             gl.enable_vertex_attrib_array(scene_uv);
@@ -349,9 +379,9 @@ impl BackgroundScene {
 }
 
 pub struct TextScene {
-    text_program: NativeProgram,
-    text_vbo: NativeBuffer,
-    atlas_text: NativeTexture,
+    text_program: GlProgram,
+    text_vbo: GlBuffer,
+    atlas_text: GlTexture,
     atlas: FontAtlas,
     scale: usize,
     w: u32,
@@ -446,21 +476,11 @@ impl TextScene {
                 glow::CLAMP_TO_EDGE as i32,
             );
             //  // resolution
-            let text_res_loc = gl
-                .get_uniform_location(text_program, "u_resolution")
-                .expect("couldn't get uniform");
-            let text_font_loc = gl
-                .get_uniform_location(text_program, "u_font")
-                .expect("u_font");
-            let text_color_loc = gl
-                .get_uniform_location(text_program, "u_color")
-                .expect("u_color");
-            let text_translate_loc = gl
-                .get_uniform_location(text_program, "u_translate")
-                .expect("u_translate");
-            let text_time_loc = gl
-                .get_uniform_location(text_program, "u_time")
-                .expect("u_time");
+            let text_res_loc = required_uniform(gl, text_program, "u_resolution")?;
+            let text_font_loc = required_uniform(gl, text_program, "u_font")?;
+            let text_color_loc = required_uniform(gl, text_program, "u_color")?;
+            let text_translate_loc = required_uniform(gl, text_program, "u_translate")?;
+            let text_time_loc = required_uniform(gl, text_program, "u_time")?;
 
             let text_vbo = gl.create_buffer()?;
 
@@ -484,7 +504,7 @@ impl TextScene {
     pub fn draw(
         &self,
         gl: &glow::Context,
-        scene_fbo: glow::NativeFramebuffer,
+        scene_fbo: GlFramebuffer,
         view: &LoginView,
     ) -> Result<(), Box<dyn std::error::Error>> {
         unsafe {
@@ -507,7 +527,9 @@ impl TextScene {
                 }
                 let blink = if *c == '_' { 1.0 } else { 0.0 };
 
-                let glyph = self.atlas.get_glyph(*c).expect("UNRENDERABLE CHAR");
+                let Some(glyph) = self.atlas.get_glyph(*c) else {
+                    continue;
+                };
                 let x0 = cursor_x as f32;
                 let x1 = (cursor_x + glyph.w) as f32;
                 let y0 = cursor_y as f32;
@@ -537,15 +559,9 @@ impl TextScene {
 
             gl.use_program(Some(self.text_program));
             //  // attr4ibuts
-            let text_pos = gl
-                .get_attrib_location(self.text_program, "a_pos")
-                .expect("a_pos");
-            let text_uv = gl
-                .get_attrib_location(self.text_program, "a_uv")
-                .expect("a_uv");
-            let blink_loc = gl
-                .get_attrib_location(self.text_program, "a_blink")
-                .expect("a_blink");
+            let text_pos = required_attrib(gl, self.text_program, "a_pos")?;
+            let text_uv = required_attrib(gl, self.text_program, "a_uv")?;
+            let blink_loc = required_attrib(gl, self.text_program, "a_blink")?;
             gl.enable_vertex_attrib_array(text_pos);
             gl.vertex_attrib_pointer_f32(text_pos, 2, glow::FLOAT, false, 20, 0);
             gl.enable_vertex_attrib_array(text_uv);
@@ -583,10 +599,10 @@ impl TextScene {
 }
 
 pub struct BackgroundFxScene {
-    prog: glow::NativeProgram,
-    vbo: glow::NativeBuffer,
-    output_tex: glow::NativeTexture,
-    output_fbo: glow::NativeFramebuffer,
+    prog: GlProgram,
+    vbo: GlBuffer,
+    output_tex: GlTexture,
+    output_fbo: GlFramebuffer,
     w: f32,
     h: f32,
     tex_loc: Option<glow::UniformLocation>,
@@ -624,6 +640,7 @@ impl BackgroundFxScene {
 
             let output_tex = gl.create_texture()?;
             gl.bind_texture(glow::TEXTURE_2D, Some(output_tex));
+            let empty_pixels = vec![0u8; (w as usize) * (h as usize) * 4];
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
@@ -633,7 +650,7 @@ impl BackgroundFxScene {
                 0,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
-                None,
+                Some(&empty_pixels),
             );
             gl.tex_parameter_i32(
                 glow::TEXTURE_2D,
@@ -665,8 +682,7 @@ impl BackgroundFxScene {
                 Some(output_tex),
                 0,
             );
-            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
-            assert_eq!(status, glow::FRAMEBUFFER_COMPLETE);
+            check_framebuffer(gl)?;
 
             let vs = compile_shader(gl, glow::VERTEX_SHADER, BackgroundFxScene::FX_VSHAD)?;
             let shader_src = fs::read_to_string(path)?;
@@ -676,8 +692,8 @@ impl BackgroundFxScene {
             gl.delete_shader(vs);
             gl.delete_shader(fs);
 
-            let pos = gl.get_attrib_location(prog, "a_pos").expect("a_pos");
-            let uv = gl.get_attrib_location(prog, "a_uv").expect("a_uv");
+            let pos = required_attrib(gl, prog, "a_pos")?;
+            let uv = required_attrib(gl, prog, "a_uv")?;
 
             Self {
                 prog,
@@ -700,18 +716,18 @@ impl BackgroundFxScene {
         Ok(fx)
     }
 
-    pub fn output_texture(&self) -> glow::NativeTexture {
+    pub fn output_texture(&self) -> GlTexture {
         self.output_tex
     }
 
-    pub fn output_fbo(&self) -> glow::NativeFramebuffer {
+    pub fn output_fbo(&self) -> GlFramebuffer {
         self.output_fbo
     }
 
     pub fn draw(
         &self,
         gl: &glow::Context,
-        texture: glow::NativeTexture,
+        texture: GlTexture,
         view: &LoginView,
     ) -> Result<(), Box<dyn std::error::Error>> {
         unsafe {
@@ -754,8 +770,8 @@ impl BackgroundFxScene {
 }
 
 pub struct PostprocScene {
-    prog: glow::NativeProgram,
-    vbo: glow::NativeBuffer,
+    prog: GlProgram,
+    vbo: GlBuffer,
     w: f32,
     h: f32,
     tex_loc: glow::UniformLocation,
@@ -801,22 +817,16 @@ impl PostprocScene {
             gl.delete_shader(vs);
             gl.delete_shader(fs);
 
-            let pos = gl.get_attrib_location(prog, "a_pos").expect("a_pos");
-            let uv = gl.get_attrib_location(prog, "a_uv").expect("a_uv");
+            let pos = required_attrib(gl, prog, "a_pos")?;
+            let uv = required_attrib(gl, prog, "a_uv")?;
 
-            let tex_loc = gl.get_uniform_location(prog, "u_tex").expect("u_tex");
+            let tex_loc = required_uniform(gl, prog, "u_tex")?;
 
-            let time_loc = gl.get_uniform_location(prog, "u_time").expect("u_time");
-            let aspect_loc = gl.get_uniform_location(prog, "u_aspect").expect("u_aspect");
-            let resolution_loc = gl
-                .get_uniform_location(prog, "u_resolution")
-                .expect("u_resolution");
-            let login_state_loc = gl
-                .get_uniform_location(prog, "u_login_state")
-                .expect("u_login_state");
-            let state_time_loc = gl
-                .get_uniform_location(prog, "u_state_time")
-                .expect("u_state_time");
+            let time_loc = required_uniform(gl, prog, "u_time")?;
+            let aspect_loc = required_uniform(gl, prog, "u_aspect")?;
+            let resolution_loc = required_uniform(gl, prog, "u_resolution")?;
+            let login_state_loc = required_uniform(gl, prog, "u_login_state")?;
+            let state_time_loc = required_uniform(gl, prog, "u_state_time")?;
             Self {
                 pos,
                 uv,
@@ -837,7 +847,7 @@ impl PostprocScene {
     pub fn draw(
         &self,
         gl: &glow::Context,
-        texture: glow::NativeTexture,
+        texture: GlTexture,
         view: &LoginView,
     ) -> Result<(), Box<dyn std::error::Error>> {
         unsafe {

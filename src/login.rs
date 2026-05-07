@@ -1,5 +1,10 @@
 use std::time::Duration;
-use std::time::Instant;
+
+#[cfg(not(target_arch = "wasm32"))]
+type ClockInstant = std::time::Instant;
+
+#[cfg(target_arch = "wasm32")]
+type ClockInstant = f64;
 
 const DOT_ANIMATION_INTERVAL: Duration = Duration::from_millis(180);
 const DOT_ANIMATION_STEPS: u128 = 4;
@@ -199,8 +204,8 @@ fn animated_dots(elapsed: Duration) -> String {
 
 pub struct LoginApp {
     state: LoginState,
-    start: Instant,
-    state_start: Instant,
+    start: ClockInstant,
+    state_start: ClockInstant,
 }
 
 impl LoginApp {
@@ -213,13 +218,13 @@ impl LoginApp {
         let transition = state.update(event);
         self.state = transition.state;
         if transition.reset_timer {
-            self.state_start = Instant::now();
+            self.state_start = clock_now();
         }
         transition.action
     }
 
     pub fn tick(&mut self) -> Option<LoginAction> {
-        if self.state_start.elapsed() > Duration::from_millis(300) {
+        if clock_elapsed(self.state_start) > Duration::from_millis(300) {
             self.handle_event(LoginEvent::TimerOver)
         } else {
             None
@@ -227,10 +232,10 @@ impl LoginApp {
     }
 
     pub fn view(&self) -> LoginView {
-        let state_elapsed = self.state_start.elapsed();
+        let state_elapsed = clock_elapsed(self.state_start);
         LoginView {
             msg: self.state.message(state_elapsed),
-            time: self.start.elapsed().as_secs_f32(),
+            time: clock_elapsed(self.start).as_secs_f32(),
             state: self.state.visual_state(),
             state_time: state_elapsed.as_secs_f32(),
         }
@@ -241,11 +246,32 @@ impl Default for LoginApp {
     fn default() -> Self {
         Self {
             state: LoginState::default(),
-            start: Instant::now(),
-            state_start: Instant::now(),
+            start: clock_now(),
+            state_start: clock_now(),
         }
     }
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+fn clock_now() -> ClockInstant {
+    std::time::Instant::now()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn clock_elapsed(start: ClockInstant) -> Duration {
+    start.elapsed()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn clock_now() -> ClockInstant {
+    js_sys::Date::now() / 1000.0
+}
+
+#[cfg(target_arch = "wasm32")]
+fn clock_elapsed(start: ClockInstant) -> Duration {
+    Duration::from_secs_f64((clock_now() - start).max(0.0))
+}
+
 pub struct LoginView {
     pub msg: String,
     pub time: f32,
