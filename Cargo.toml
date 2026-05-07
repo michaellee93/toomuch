@@ -28,7 +28,6 @@ gbm = { version = "0.14", features = ["drm-support"] }
 gbm-sys = "0.3"
 khronos-egl = { version = "6.0.0", features = ["static"] }
 libc = "0.2"
-minifb = "0.25"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3.95"
