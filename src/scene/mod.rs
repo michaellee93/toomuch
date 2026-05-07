@@ -57,6 +57,19 @@ impl Scene {
         })
     }
 
+    pub fn set_effect_texture(
+        &mut self,
+        gl: &glow::Context,
+        data: &[u8],
+        w: u32,
+        h: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(fx) = &mut self.background_fx {
+            fx.set_aux_texture(gl, data, w, h)?;
+        }
+        Ok(())
+    }
+
     pub fn draw(
         &self,
         gl: &glow::Context,
@@ -184,6 +197,29 @@ fn create_atlas(scale: usize) -> FontAtlas {
         h,
         glyph_map,
     }
+}
+
+fn create_luminance_ramp_atlas(scale: usize) -> (Vec<u8>, u32, u32) {
+    const FG: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
+    let cell = 8 * scale;
+
+    // Sort printable ASCII by pixel density (dark → bright)
+    let mut ramp: Vec<u8> = (32u8..=126).collect();
+    ramp.sort_by_key(|&c| {
+        BASIC_LEGACY[c as usize]
+            .iter()
+            .map(|b| b.count_ones())
+            .sum::<u32>()
+    });
+
+    let n = ramp.len(); // 95
+    let w = n * cell;
+    let h = cell;
+    let mut rgba = vec![0u8; w * h * 4];
+    for (i, &code) in ramp.iter().enumerate() {
+        draw_glyph(&mut rgba, w, h, BASIC_LEGACY[code as usize], i * cell, 0, scale, FG);
+    }
+    (rgba, w as u32, h as u32)
 }
 
 unsafe fn compile_shader(
@@ -665,6 +701,8 @@ pub struct BackgroundFxScene {
     state_time_loc: Option<glow::UniformLocation>,
     pos: u32,
     uv: u32,
+    aux_tex: Option<GlTexture>,
+    aux_tex_loc: Option<glow::UniformLocation>,
 }
 
 impl BackgroundFxScene {
@@ -762,6 +800,22 @@ impl BackgroundFxScene {
                 state_time_loc: gl.get_uniform_location(prog, "u_state_time"),
                 pos,
                 uv,
+                aux_tex: {
+                    let (ramp_rgba, ramp_w, ramp_h) = create_luminance_ramp_atlas(2);
+                    let tex = gl.create_texture()?;
+                    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                    gl.tex_image_2d(
+                        glow::TEXTURE_2D, 0, glow::RGBA as i32,
+                        ramp_w as i32, ramp_h as i32, 0,
+                        glow::RGBA, glow::UNSIGNED_BYTE, Some(&ramp_rgba),
+                    );
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+                    Some(tex)
+                },
+                aux_tex_loc: gl.get_uniform_location(prog, "u_aux_tex"),
             }
         };
 
@@ -774,6 +828,39 @@ impl BackgroundFxScene {
 
     pub fn output_fbo(&self) -> GlFramebuffer {
         self.output_fbo
+    }
+
+    pub fn set_aux_texture(
+        &mut self,
+        gl: &glow::Context,
+        data: &[u8],
+        w: u32,
+        h: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            if let Some(old) = self.aux_tex.take() {
+                gl.delete_texture(old);
+            }
+            let tex = gl.create_texture()?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                w as i32,
+                h as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                Some(data),
+            );
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+            self.aux_tex = Some(tex);
+        }
+        Ok(())
     }
 
     pub fn draw(
@@ -813,7 +900,14 @@ impl BackgroundFxScene {
             if let Some(state_time_loc) = &self.state_time_loc {
                 gl.uniform_1_f32(Some(state_time_loc), view.state_time);
             }
-
+            if let Some(aux) = self.aux_tex {
+                gl.active_texture(glow::TEXTURE1);
+                gl.bind_texture(glow::TEXTURE_2D, Some(aux));
+                gl.active_texture(glow::TEXTURE0);
+            }
+            if let Some(loc) = &self.aux_tex_loc {
+                gl.uniform_1_i32(Some(loc), 1);
+            }
             gl.clear(COLOR_BUFFER_BIT);
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         }

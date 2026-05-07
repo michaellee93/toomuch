@@ -199,7 +199,7 @@ impl LoginState {
 
 fn animated_dots(elapsed: Duration) -> String {
     let step = elapsed.as_millis() / DOT_ANIMATION_INTERVAL.as_millis();
-    ".".repeat((step % DOT_ANIMATION_STEPS) as usize)
+    format!("{:<3}", ".".repeat((step % DOT_ANIMATION_STEPS) as usize))
 }
 
 pub struct LoginApp {

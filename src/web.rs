@@ -15,6 +15,9 @@ struct Runtime {
     app: LoginApp,
     w: u32,
     h: u32,
+    effect_texture: Option<(Vec<u8>, u32, u32)>,
+    canvas: HtmlCanvasElement,
+    config: Config,
 }
 
 #[wasm_bindgen]
@@ -54,6 +57,9 @@ impl WebApp {
             app: LoginApp::new(),
             w,
             h,
+            effect_texture: None,
+            canvas,
+            config: cfg,
         }));
 
         let key_runtime = runtime.clone();
@@ -120,7 +126,36 @@ impl WebApp {
         let cfg = parse_config(config_toml)?;
         let mut runtime = self.runtime.borrow_mut();
         runtime.scene = Scene::new(&runtime.gl, &cfg, runtime.w, runtime.h).map_err(js_err)?;
+        runtime.config = cfg;
+        let tex = runtime.effect_texture.as_ref().map(|(d, w, h)| (d.clone(), *w, *h));
+        if let Some((data, w, h)) = tex {
+            let rt = &mut *runtime;
+            rt.scene.set_effect_texture(&rt.gl, &data, w, h).map_err(js_err)?;
+        }
         Ok(())
+    }
+
+    pub fn resize(&self) -> Result<(), JsValue> {
+        let window = web_sys::window().ok_or_else(|| js_err("window unavailable"))?;
+        let mut runtime = self.runtime.borrow_mut();
+        let (w, h) = resize_canvas(&window, &runtime.canvas);
+        runtime.w = w;
+        runtime.h = h;
+        let cfg = runtime.config.clone();
+        runtime.scene = Scene::new(&runtime.gl, &cfg, w, h).map_err(js_err)?;
+        let tex = runtime.effect_texture.as_ref().map(|(d, w, h)| (d.clone(), *w, *h));
+        if let Some((data, tw, th)) = tex {
+            let rt = &mut *runtime;
+            rt.scene.set_effect_texture(&rt.gl, &data, tw, th).map_err(js_err)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_effect_texture(&self, data: &[u8], width: u32, height: u32) -> Result<(), JsValue> {
+        let mut runtime = self.runtime.borrow_mut();
+        runtime.effect_texture = Some((data.to_vec(), width, height));
+        let rt = &mut *runtime;
+        rt.scene.set_effect_texture(&rt.gl, data, width, height).map_err(js_err)
     }
 }
 
