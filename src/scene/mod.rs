@@ -1,13 +1,34 @@
-use crate::{BackgroundEffect, Config, InputConfig, PostConfig, login::LoginView};
+use crate::{BackgroundConfig, BackgroundEffect, Config, InputConfig, PostConfig, login::LoginView};
 use font8x8::legacy::BASIC_LEGACY;
 use glow::{COLOR_BUFFER_BIT, HasContext};
 use std::collections::HashMap;
+use std::fs;
+use std::io;
 
 type GlBuffer = <glow::Context as HasContext>::Buffer;
 type GlFramebuffer = <glow::Context as HasContext>::Framebuffer;
 type GlProgram = <glow::Context as HasContext>::Program;
 type GlShader = <glow::Context as HasContext>::Shader;
 type GlTexture = <glow::Context as HasContext>::Texture;
+
+fn load_shader(path: &str) -> io::Result<String> {
+    fs::read_to_string(path)
+}
+
+fn background_effect_shader_src(effect: &BackgroundEffect) -> Result<String, io::Error> {
+    if let Some(shader) = &effect.shader {
+        return Ok(shader.clone());
+    }
+
+    if let Some(path) = &effect.path {
+        return load_shader(path);
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "background.effect requires path or shader",
+    ))
+}
 
 pub struct Scene {
     background: BackgroundScene,
@@ -24,7 +45,7 @@ impl Scene {
         h: u32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            background: BackgroundScene::new(gl, w, h)?,
+            background: BackgroundScene::new(gl, &cfg.background, w, h)?,
             background_fx: cfg
                 .background
                 .effect
@@ -41,7 +62,7 @@ impl Scene {
         gl: &glow::Context,
         view: &LoginView,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.background.draw(gl);
+        self.background.draw(gl, view);
 
         let (texture, fbo) = if let Some(background_fx) = &self.background_fx {
             background_fx.draw(gl, self.background.output_texture(), view)?;
@@ -239,8 +260,9 @@ pub struct BackgroundScene {
     w: u32,
     h: u32,
     scene_program: GlProgram,
-    scene_uv: u32,
+    scene_uv: Option<u32>,
     scene_pos: u32,
+    time_loc: Option<glow::UniformLocation>,
 }
 
 impl BackgroundScene {
@@ -268,7 +290,19 @@ impl BackgroundScene {
         self.scene_fbo
     }
 
-    pub fn new(gl: &glow::Context, w: u32, h: u32) -> Result<Self, Box<dyn std::error::Error>> {
+    fn shader_src(cfg: &BackgroundConfig) -> String {
+        if let Some(shader) = &cfg.shader {
+            return shader.clone();
+        }
+
+        cfg.path
+            .as_deref()
+            .map(load_shader)
+            .unwrap_or_else(|| Ok(Self::BG_FSHAD.into()))
+            .unwrap_or_else(|_| Self::BG_FSHAD.into())
+    }
+
+    pub fn new(gl: &glow::Context, cfg: &BackgroundConfig, w: u32, h: u32) -> Result<Self, Box<dyn std::error::Error>> {
         #[rustfmt::skip]
         let verts: [f32; 16] = [
             -1.0,  1.0,  0.0, 1.0,
@@ -334,18 +368,20 @@ impl BackgroundScene {
             check_framebuffer(gl)?;
 
             let scene_vshad = compile_shader(&gl, glow::VERTEX_SHADER, BackgroundScene::BG_VSHAD)?;
-            let scene_fshad =
-                compile_shader(&gl, glow::FRAGMENT_SHADER, BackgroundScene::BG_FSHAD)?;
+            let scene_fshad = compile_shader(&gl, glow::FRAGMENT_SHADER, &Self::shader_src(cfg))?;
             let scene_program = link_program(&gl, scene_vshad, scene_fshad)?;
             gl.delete_shader(scene_vshad);
             gl.delete_shader(scene_fshad);
 
             let scene_pos = required_attrib(gl, scene_program, "a_pos")?;
-            let scene_uv = required_attrib(gl, scene_program, "a_uv")?;
+            let scene_uv = gl.get_attrib_location(scene_program, "a_uv");
             gl.enable_vertex_attrib_array(scene_pos);
             gl.vertex_attrib_pointer_f32(scene_pos, 2, glow::FLOAT, false, 16, 0);
-            gl.enable_vertex_attrib_array(scene_uv);
-            gl.vertex_attrib_pointer_f32(scene_uv, 2, glow::FLOAT, false, 16, 8);
+            if let Some(uv) = scene_uv {
+                gl.enable_vertex_attrib_array(uv);
+                gl.vertex_attrib_pointer_f32(uv, 2, glow::FLOAT, false, 16, 8);
+            }
+            let time_loc = gl.get_uniform_location(scene_program, "u_time");
             Ok(Self {
                 scene_fbo,
                 scene_program,
@@ -355,22 +391,27 @@ impl BackgroundScene {
                 w,
                 scene_pos,
                 scene_uv,
+                time_loc,
             })
         };
         bg
     }
 
-    pub fn draw(&self, gl: &glow::Context) {
+    pub fn draw(&self, gl: &glow::Context, view: &LoginView) {
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.scene_fbo));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
             gl.enable_vertex_attrib_array(self.scene_pos);
             gl.vertex_attrib_pointer_f32(self.scene_pos, 2, glow::FLOAT, false, 16, 0);
-            gl.enable_vertex_attrib_array(self.scene_uv);
-            gl.vertex_attrib_pointer_f32(self.scene_uv, 2, glow::FLOAT, false, 16, 8);
-            // draw the base scene
+            if let Some(uv) = self.scene_uv {
+                gl.enable_vertex_attrib_array(uv);
+                gl.vertex_attrib_pointer_f32(uv, 2, glow::FLOAT, false, 16, 8);
+            }
             gl.viewport(0, 0, self.w as i32, self.h as i32);
             gl.use_program(Some(self.scene_program));
+            if let Some(loc) = &self.time_loc {
+                gl.uniform_1_f32(Some(loc), view.time);
+            }
             gl.clear(COLOR_BUFFER_BIT);
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         }
@@ -684,7 +725,7 @@ impl BackgroundFxScene {
             check_framebuffer(gl)?;
 
             let vs = compile_shader(gl, glow::VERTEX_SHADER, BackgroundFxScene::FX_VSHAD)?;
-            let shader_src = effect.shader_src()?;
+            let shader_src = background_effect_shader_src(effect)?;
             let fs = compile_shader(gl, glow::FRAGMENT_SHADER, &shader_src)?;
             let prog = link_program(gl, vs, fs)?;
             gl.use_program(Some(prog));
@@ -773,12 +814,12 @@ pub struct PostprocScene {
     vbo: GlBuffer,
     w: f32,
     h: f32,
-    tex_loc: glow::UniformLocation,
-    time_loc: glow::UniformLocation,
-    aspect_loc: glow::UniformLocation,
-    resolution_loc: glow::UniformLocation,
-    login_state_loc: glow::UniformLocation,
-    state_time_loc: glow::UniformLocation,
+    tex_loc: Option<glow::UniformLocation>,
+    time_loc: Option<glow::UniformLocation>,
+    aspect_loc: Option<glow::UniformLocation>,
+    resolution_loc: Option<glow::UniformLocation>,
+    login_state_loc: Option<glow::UniformLocation>,
+    state_time_loc: Option<glow::UniformLocation>,
     pos: u32,
     uv: u32,
 }
@@ -786,6 +827,72 @@ pub struct PostprocScene {
 impl PostprocScene {
     const POST_VSHAD: &str = "attribute vec2 a_pos; attribute vec2 a_uv; varying vec2 v_uv; \
              void main() { gl_Position = vec4(a_pos, 0.0, 1.0); v_uv = a_uv; }";
+    const POST_FSHAD: &str = "precision highp float; \
+             uniform sampler2D u_tex; \
+	             uniform float u_time; \
+	             uniform float u_aspect; \
+	             uniform vec2 u_resolution; \
+	             uniform int u_login_state; \
+	             uniform float u_state_time; \
+	             varying vec2 v_uv; \
+                 float hash(float n) { n = fract(n * 0.1031); n *= n + 33.33; n *= n + n; return fract(n); } \
+	             void main() { \
+                 vec2 centered = v_uv * 2.0 - 1.0; \
+                 centered.x *= u_aspect; \
+                 float r2 = dot(centered, centered); \
+	                 vec2 curved = centered * (1.0 + 0.018 * r2); \
+	                 curved.x /= u_aspect; \
+	                 vec2 uv = curved * 0.5 + 0.5; \
+	                 vec2 feather = 4.0 / u_resolution; \
+	                 vec2 edge = smoothstep(vec2(0.0), feather, uv) * smoothstep(vec2(0.0), feather, 1.0 - uv); \
+	                 float screen_mask = edge.x * edge.y; \
+	                 uv = clamp(uv, vec2(0.0), vec2(1.0)); \
+	                 float burst = pow(max(0.0, sin(u_time * 0.7 + sin(u_time * 0.19) * 2.4)), 18.0); \
+                         float failure_hit = 0.0; \
+                         if (u_login_state == 4) { failure_hit = exp(-u_state_time * 2.8); } \
+                         float glitch_band = floor(uv.y * 48.0); \
+                         float glitch_tick = mod(floor(u_time * 18.0), 64.0); \
+                         float glitch_gate = step(0.72, hash(glitch_band * 17.0 + glitch_tick)); \
+                         float glitch_offset = (hash(glitch_band * 61.0 + glitch_tick * 7.0) - 0.5) * 0.09 * failure_hit * glitch_gate; \
+		                 uv.x += sin(uv.y * 42.0 + u_time * 18.0) * 0.0025 * burst + glitch_offset; \
+                         uv.x = fract(uv.x); \
+		                 uv = clamp(uv, vec2(0.0), vec2(1.0)); \
+                 vec2 px = 1.0 / u_resolution; \
+                 float aberration = 0.0007 + 0.0012 * r2 + 0.006 * failure_hit; \
+                 float red = texture2D(u_tex, uv + vec2(aberration, 0.0)).r; \
+                 float green = texture2D(u_tex, uv).g; \
+                 float blue = texture2D(u_tex, uv - vec2(aberration, 0.0)).b; \
+                 vec4 base = vec4(red, green, blue, 1.0); \
+                 vec3 glow = texture2D(u_tex, uv + vec2(px.x * 2.0, 0.0)).rgb; \
+                 glow += texture2D(u_tex, uv - vec2(px.x * 2.0, 0.0)).rgb; \
+                 glow += texture2D(u_tex, uv + vec2(0.0, px.y * 2.0)).rgb; \
+                 glow += texture2D(u_tex, uv - vec2(0.0, px.y * 2.0)).rgb; \
+                 glow *= 0.25; \
+                 float scanline = 0.965 + 0.035 * sin(uv.y * u_resolution.y * 3.14159); \
+                 float vignette = smoothstep(1.18, 0.35, length(centered)); \
+                 float luma = dot(base.rgb, vec3(0.299, 0.587, 0.114)); \
+                 float white_variation = 1.0 + 0.045 * sin(u_time * 1.7 + uv.y * 17.0 + uv.x * 5.0); \
+                 vec3 color = base.rgb + glow * 0.22; \
+                 color *= mix(1.0, white_variation, smoothstep(0.45, 0.85, luma)); \
+		                 color *= scanline; \
+		                 color *= 0.88 + 0.12 * vignette; \
+                         color += vec3(0.02, 0.025, 0.04) * burst; \
+                         color = mix(color, vec3(color.r + 0.45, color.g * 0.55, color.b * 0.55), failure_hit); \
+		                 color = mix(vec3(0.03, 0.028, 0.04), color, screen_mask); \
+	                 gl_FragColor = vec4(color, 1.0); \
+	             }";
+
+    fn shader_src(cfg: &PostConfig) -> String {
+        if let Some(shader) = &cfg.shader {
+            return shader.clone();
+        }
+
+        cfg.path
+            .as_deref()
+            .map(load_shader)
+            .unwrap_or_else(|| Ok(Self::POST_FSHAD.into()))
+            .unwrap_or_else(|_| Self::POST_FSHAD.into())
+    }
 
     pub fn new(
         gl: &glow::Context,
@@ -809,8 +916,8 @@ impl PostprocScene {
 
             // Minimal GLSL ES shader: fullscreen textured quad.
             let vs = compile_shader(&gl, glow::VERTEX_SHADER, PostprocScene::POST_VSHAD)?;
-            //let fs = compile_shader(&gl, glow::FRAGMENT_SHADER, PostprocScene::POST_FSHAD)?;
-            let fs = compile_shader(&gl, glow::FRAGMENT_SHADER, &cfg.shader_src()?)?;
+            let shader_src = Self::shader_src(cfg);
+            let fs = compile_shader(&gl, glow::FRAGMENT_SHADER, &shader_src)?;
             let prog = link_program(&gl, vs, fs)?;
             gl.use_program(Some(prog));
             gl.delete_shader(vs);
@@ -819,13 +926,12 @@ impl PostprocScene {
             let pos = required_attrib(gl, prog, "a_pos")?;
             let uv = required_attrib(gl, prog, "a_uv")?;
 
-            let tex_loc = required_uniform(gl, prog, "u_tex")?;
-
-            let time_loc = required_uniform(gl, prog, "u_time")?;
-            let aspect_loc = required_uniform(gl, prog, "u_aspect")?;
-            let resolution_loc = required_uniform(gl, prog, "u_resolution")?;
-            let login_state_loc = required_uniform(gl, prog, "u_login_state")?;
-            let state_time_loc = required_uniform(gl, prog, "u_state_time")?;
+            let tex_loc = gl.get_uniform_location(prog, "u_tex");
+            let time_loc = gl.get_uniform_location(prog, "u_time");
+            let aspect_loc = gl.get_uniform_location(prog, "u_aspect");
+            let resolution_loc = gl.get_uniform_location(prog, "u_resolution");
+            let login_state_loc = gl.get_uniform_location(prog, "u_login_state");
+            let state_time_loc = gl.get_uniform_location(prog, "u_state_time");
             Self {
                 pos,
                 uv,
@@ -862,13 +968,24 @@ impl PostprocScene {
             gl.enable_vertex_attrib_array(self.uv);
             gl.vertex_attrib_pointer_f32(self.uv, 2, glow::FLOAT, false, 16, 8);
 
-            gl.uniform_1_i32(Some(&self.tex_loc), 0);
-            gl.uniform_1_f32(Some(&self.aspect_loc), self.w / self.h);
-            gl.uniform_2_f32(Some(&self.resolution_loc), self.w, self.h);
-
-            gl.uniform_1_f32(Some(&self.time_loc), view.time);
-            gl.uniform_1_i32(Some(&self.login_state_loc), view.state);
-            gl.uniform_1_f32(Some(&self.state_time_loc), view.state_time);
+            if let Some(tex_loc) = &self.tex_loc {
+                gl.uniform_1_i32(Some(tex_loc), 0);
+            }
+            if let Some(aspect_loc) = &self.aspect_loc {
+                gl.uniform_1_f32(Some(aspect_loc), self.w / self.h);
+            }
+            if let Some(resolution_loc) = &self.resolution_loc {
+                gl.uniform_2_f32(Some(resolution_loc), self.w, self.h);
+            }
+            if let Some(time_loc) = &self.time_loc {
+                gl.uniform_1_f32(Some(time_loc), view.time);
+            }
+            if let Some(login_state_loc) = &self.login_state_loc {
+                gl.uniform_1_i32(Some(login_state_loc), view.state);
+            }
+            if let Some(state_time_loc) = &self.state_time_loc {
+                gl.uniform_1_f32(Some(state_time_loc), view.state_time);
+            }
             gl.clear(COLOR_BUFFER_BIT);
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         }

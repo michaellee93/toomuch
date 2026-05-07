@@ -13,12 +13,15 @@ struct Runtime {
     gl: glow::Context,
     scene: Scene,
     app: LoginApp,
+    w: u32,
+    h: u32,
 }
 
 #[wasm_bindgen]
 pub struct WebApp {
     _keydown: Closure<dyn FnMut(KeyboardEvent)>,
     _frame: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>,
+    runtime: Rc<RefCell<Runtime>>,
 }
 
 #[wasm_bindgen]
@@ -49,6 +52,8 @@ impl WebApp {
             gl,
             scene,
             app: LoginApp::new(),
+            w,
+            h,
         }));
 
         let key_runtime = runtime.clone();
@@ -61,6 +66,12 @@ impl WebApp {
 
             let mut runtime = key_runtime.borrow_mut();
             match runtime.app.handle_event(login_event) {
+                Some(LoginAction::Authenticate { username, password })
+                    if username == "user" && password == "password" =>
+                {
+                    runtime.app.handle_event(LoginEvent::AuthAccepted);
+                    runtime.app.handle_event(LoginEvent::SessionStarted);
+                }
                 Some(LoginAction::Authenticate { .. }) => {
                     runtime.app.handle_event(LoginEvent::AuthFailure);
                 }
@@ -101,7 +112,15 @@ impl WebApp {
         Ok(WebApp {
             _keydown: keydown,
             _frame: next_frame,
+            runtime,
         })
+    }
+
+    pub fn reload_config(&self, config_toml: &str) -> Result<(), JsValue> {
+        let cfg = parse_config(config_toml)?;
+        let mut runtime = self.runtime.borrow_mut();
+        runtime.scene = Scene::new(&runtime.gl, &cfg, runtime.w, runtime.h).map_err(js_err)?;
+        Ok(())
     }
 }
 
