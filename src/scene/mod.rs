@@ -263,6 +263,8 @@ pub struct BackgroundScene {
     scene_uv: Option<u32>,
     scene_pos: u32,
     time_loc: Option<glow::UniformLocation>,
+    resolution_loc: Option<glow::UniformLocation>,
+    aspect_loc: Option<glow::UniformLocation>,
 }
 
 impl BackgroundScene {
@@ -382,6 +384,8 @@ impl BackgroundScene {
                 gl.vertex_attrib_pointer_f32(uv, 2, glow::FLOAT, false, 16, 8);
             }
             let time_loc = gl.get_uniform_location(scene_program, "u_time");
+            let resolution_loc = gl.get_uniform_location(scene_program, "u_resolution");
+            let aspect_loc = gl.get_uniform_location(scene_program, "u_aspect");
             Ok(Self {
                 scene_fbo,
                 scene_program,
@@ -392,6 +396,8 @@ impl BackgroundScene {
                 scene_pos,
                 scene_uv,
                 time_loc,
+                resolution_loc,
+                aspect_loc,
             })
         };
         bg
@@ -411,6 +417,12 @@ impl BackgroundScene {
             gl.use_program(Some(self.scene_program));
             if let Some(loc) = &self.time_loc {
                 gl.uniform_1_f32(Some(loc), view.time);
+            }
+            if let Some(loc) = &self.resolution_loc {
+                gl.uniform_2_f32(Some(loc), self.w as f32, self.h as f32);
+            }
+            if let Some(loc) = &self.aspect_loc {
+                gl.uniform_1_f32(Some(loc), self.w as f32 / self.h as f32);
             }
             gl.clear(COLOR_BUFFER_BIT);
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
