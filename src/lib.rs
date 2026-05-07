@@ -5,6 +5,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+pub mod display;
 pub mod greetd_client;
 pub mod keyboard;
 pub mod login;
