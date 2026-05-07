@@ -1,8 +1,7 @@
-use crate::{Config, InputConfig, PostConfig, login::LoginView};
+use crate::{BackgroundEffect, Config, InputConfig, PostConfig, login::LoginView};
 use font8x8::legacy::BASIC_LEGACY;
 use glow::{COLOR_BUFFER_BIT, HasContext};
 use std::collections::HashMap;
-use std::fs;
 
 type GlBuffer = <glow::Context as HasContext>::Buffer;
 type GlFramebuffer = <glow::Context as HasContext>::Framebuffer;
@@ -30,7 +29,7 @@ impl Scene {
                 .background
                 .effect
                 .as_ref()
-                .map(|effect| BackgroundFxScene::new(gl, &effect.path, w, h))
+                .map(|effect| BackgroundFxScene::new(gl, effect, w, h))
                 .transpose()?,
             text: TextScene::new(gl, &cfg.input, w, h)?,
             post: PostprocScene::new(gl, &cfg.post, w, h)?,
@@ -621,7 +620,7 @@ impl BackgroundFxScene {
 
     pub fn new(
         gl: &glow::Context,
-        path: &str,
+        effect: &BackgroundEffect,
         w: u32,
         h: u32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -685,7 +684,7 @@ impl BackgroundFxScene {
             check_framebuffer(gl)?;
 
             let vs = compile_shader(gl, glow::VERTEX_SHADER, BackgroundFxScene::FX_VSHAD)?;
-            let shader_src = fs::read_to_string(path)?;
+            let shader_src = effect.shader_src()?;
             let fs = compile_shader(gl, glow::FRAGMENT_SHADER, &shader_src)?;
             let prog = link_program(gl, vs, fs)?;
             gl.use_program(Some(prog));
