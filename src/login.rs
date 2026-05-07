@@ -1,4 +1,5 @@
 use std::time::Duration;
+use std::time::Instant;
 
 const DOT_ANIMATION_INTERVAL: Duration = Duration::from_millis(180);
 const DOT_ANIMATION_STEPS: u128 = 4;
@@ -194,4 +195,60 @@ impl LoginState {
 fn animated_dots(elapsed: Duration) -> String {
     let step = elapsed.as_millis() / DOT_ANIMATION_INTERVAL.as_millis();
     ".".repeat((step % DOT_ANIMATION_STEPS) as usize)
+}
+
+pub struct LoginApp {
+    state: LoginState,
+    start: Instant,
+    state_start: Instant,
+}
+
+impl LoginApp {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn handle_event(&mut self, event: LoginEvent) -> Option<LoginAction> {
+        let state = std::mem::take(&mut self.state);
+        let transition = state.update(event);
+        self.state = transition.state;
+        if transition.reset_timer {
+            self.state_start = Instant::now();
+        }
+        transition.action
+    }
+
+    pub fn tick(&mut self) -> Option<LoginAction> {
+        if self.state_start.elapsed() > Duration::from_millis(300) {
+            self.handle_event(LoginEvent::TimerOver)
+        } else {
+            None
+        }
+    }
+
+    pub fn view(&self) -> LoginView {
+        let state_elapsed = self.state_start.elapsed();
+        LoginView {
+            msg: self.state.message(state_elapsed),
+            time: self.start.elapsed().as_secs_f32(),
+            state: self.state.visual_state(),
+            state_time: state_elapsed.as_secs_f32(),
+        }
+    }
+}
+
+impl Default for LoginApp {
+    fn default() -> Self {
+        Self {
+            state: LoginState::default(),
+            start: Instant::now(),
+            state_start: Instant::now(),
+        }
+    }
+}
+pub struct LoginView {
+    pub msg: String,
+    pub time: f32,
+    pub state: i32,
+    pub state_time: f32,
 }
