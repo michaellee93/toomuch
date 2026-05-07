@@ -272,8 +272,32 @@ pub enum InputType {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct BackgroundEffect {
-    pub path: String,
+    pub path: Option<String>,
+    pub shader: Option<String>,
+}
+
+impl Default for BackgroundEffect {
+    fn default() -> Self {
+        Self {
+            path: None,
+            shader: None,
+        }
+    }
+}
+
+impl BackgroundEffect {
+    pub fn shader_src(&self) -> Result<String, std::io::Error> {
+        match (&self.shader, &self.path) {
+            (Some(shader), _) => Ok(shader.clone()),
+            (None, Some(path)) => fs::read_to_string(path),
+            (None, None) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "background.effect requires path or shader",
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -286,13 +310,15 @@ pub struct ShaderConfig {
 #[serde(default)]
 pub struct PostConfig {
     pub path: Option<String>,
+    pub shader: Option<String>,
 }
 
 impl PostConfig {
     pub fn shader_src(&self) -> Result<String, std::io::Error> {
-        match &self.path {
-            Some(path) => fs::read_to_string(path),
-            None => Ok(POST_FSHAD.into()),
+        match (&self.shader, &self.path) {
+            (Some(shader), _) => Ok(shader.clone()),
+            (None, Some(path)) => fs::read_to_string(path),
+            (None, None) => Ok(POST_FSHAD.into()),
         }
     }
 }
@@ -320,8 +346,38 @@ mod tests {
         assert_eq!(
             config.background.effect,
             Some(BackgroundEffect {
-                path: "fragment.glsl".to_owned(),
+                path: Some("fragment.glsl".to_owned()),
+                shader: None,
             }),
+        );
+    }
+
+    #[test]
+    fn post_shader_accepts_raw_source() {
+        let config = Config::from_toml_str(
+            r#"
+            [post]
+            shader = "void main() {}"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.post.shader.as_deref(), Some("void main() {}"));
+    }
+
+    #[test]
+    fn background_effect_accepts_raw_source() {
+        let config = Config::from_toml_str(
+            r#"
+            [background.effect]
+            shader = "void main() {}"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.background.effect.and_then(|effect| effect.shader),
+            Some("void main() {}".to_owned()),
         );
     }
 }
