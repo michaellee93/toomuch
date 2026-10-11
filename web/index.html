@@ -70,7 +70,7 @@
         flex: 1;
         min-height: 0;
         display: grid;
-        grid-template-rows: auto auto 1fr auto 1fr auto 1fr auto auto;
+        grid-template-rows: auto auto 1fr auto auto 1fr auto 1fr auto auto;
         gap: 10px;
       }
 
@@ -189,14 +189,18 @@
           <button class="preset-btn" data-src="./shaders/bg/danilo.glsl">danilo</button>
           <button class="preset-btn" data-src="./shaders/bg/protean.glsl">protean</button>
         </div>
-        <textarea id="bg-shader" spellcheck="false"></textarea>
+        <textarea id="bg-shader" spellcheck="false" placeholder="// built-in"></textarea>
         <div style="display:flex;align-items:center;justify-content:space-between;">
           <label for="effect-shader">effect.glsl</label>
-          <button id="effect-toggle" class="preset-btn" style="font-size:10px;">enabled</button>
+          <button id="effect-toggle" class="preset-btn" style="font-size:10px;opacity:0.4;">disabled</button>
         </div>
-        <textarea id="effect-shader" spellcheck="false"></textarea>
+        <div class="preset-bar" data-target="effect-shader">
+          <button class="preset-btn" data-src="./shaders/effect/ascii.glsl">ascii</button>
+          <button class="preset-btn" data-src="./shaders/effect/kuwahara.glsl">kuwahara</button>
+        </div>
+        <textarea id="effect-shader" spellcheck="false" placeholder="// none"></textarea>
         <label for="post-shader">postproc.glsl</label>
-        <textarea id="post-shader" spellcheck="false"></textarea>
+        <textarea id="post-shader" spellcheck="false" placeholder="// built-in CRT"></textarea>
         <button id="render" class="btn" type="button">Render</button>
         <pre id="error"></pre>
       </div>
@@ -204,155 +208,6 @@
     <script type="module">
       import init, { start } from "./pkg/toomuch.js";
 
-      const defaultBgShader = `precision highp float;
-varying vec2 v_uv;
-uniform float u_time;
-uniform float u_aspect;
-
-float smin(float a, float b, float k) {
-  float h = max(k - abs(a - b), 0.0) / k;
-  return min(a, b) - h * h * k * 0.25;
-}
-
-void main() {
-  vec2 uv = (v_uv - 0.5) * 2.0;
-  uv.x *= u_aspect;
-  float t = u_time * 0.22;
-
-  vec2 o0 = vec2(sin(t * 1.00)       * 0.55 * u_aspect, cos(t * 0.70)       * 0.45);
-  vec2 o1 = vec2(sin(t * 0.60 + 2.1) * 0.60 * u_aspect, cos(t * 1.20 + 1.0) * 0.40);
-  vec2 o2 = vec2(sin(t * 1.30 + 4.2) * 0.40 * u_aspect, cos(t * 0.50 + 3.1) * 0.55);
-  vec2 o3 = vec2(sin(t * 0.90 + 1.5) * 0.50 * u_aspect, cos(t * 1.40 + 0.7) * 0.35);
-
-  float d = length(uv - o0) - 0.28;
-  d = smin(d, length(uv - o1) - 0.22, 0.35);
-  d = smin(d, length(uv - o2) - 0.20, 0.30);
-  d = smin(d, length(uv - o3) - 0.18, 0.28);
-
-  float glow = exp(-max(d, 0.0) * 4.5);
-  float fill = smoothstep(0.01, -0.01, d);
-  float rim  = smoothstep(0.0, 0.07, d) * smoothstep(0.14, 0.03, d);
-
-  float w0 = exp(-length(uv - o0) * 2.5);
-  float w1 = exp(-length(uv - o1) * 2.5);
-  float w2 = exp(-length(uv - o2) * 2.5);
-  float w3 = exp(-length(uv - o3) * 2.5);
-  float wt = w0 + w1 + w2 + w3 + 1e-5;
-
-  vec3 c0 = vec3(0.14, 0.04, 0.40);
-  vec3 c1 = vec3(0.04, 0.10, 0.50);
-  vec3 c2 = vec3(0.30, 0.04, 0.35);
-  vec3 c3 = vec3(0.04, 0.16, 0.45);
-  vec3 orbColor = (c0*w0 + c1*w1 + c2*w2 + c3*w3) / wt;
-
-  vec3 col = vec3(0.03, 0.03, 0.055);
-  col += orbColor * glow * 0.55;
-  col += orbColor * fill * 0.35;
-  col += vec3(0.55, 0.65, 1.0) * rim * 0.12;
-  col *= 1.0 - dot(v_uv - 0.5, v_uv - 0.5) * 1.1;
-
-  gl_FragColor = vec4(col, 1.0);
-}`;
-
-      const defaultEffectShader = `precision highp float;
-uniform sampler2D u_tex;
-uniform sampler2D u_aux_tex;
-uniform float u_time;
-uniform float u_aspect;
-uniform vec2 u_resolution;
-uniform int u_login_state;
-uniform float u_state_time;
-varying vec2 v_uv;
-
-const float CHAR_W   = 16.0;
-const float CHAR_H   = 16.0;
-const float RAMP_LEN = 95.0;
-
-void main() {
-  vec2 cSz   = vec2(CHAR_W, CHAR_H);
-  vec2 cidx  = floor(v_uv * u_resolution / cSz);
-  vec2 ctr   = (cidx + 0.5) * cSz / u_resolution;
-
-  vec4 bg    = texture2D(u_tex, ctr);
-  float luma  = dot(bg.rgb, vec3(0.299, 0.587, 0.114));
-  float lumag = pow(luma, 0.45);
-
-  float ci    = floor(lumag * (RAMP_LEN - 1.0));
-  vec2 inCell = fract(v_uv * u_resolution / cSz);
-  float mask  = texture2D(u_aux_tex, vec2((ci + inCell.x) / RAMP_LEN, 1.0 - inCell.y)).r;
-
-  vec3 bloom = vec3(0.0);
-  float bwt  = 0.0;
-  for (int dy = -2; dy <= 2; dy++) {
-    for (int dx = -2; dx <= 2; dx++) {
-      vec2 nc  = (cidx + vec2(float(dx), float(dy)) + 0.5) * cSz / u_resolution;
-      vec3 s   = texture2D(u_tex, clamp(nc, vec2(0.0), vec2(1.0))).rgb;
-      float nl = dot(s, vec3(0.299, 0.587, 0.114));
-      float w  = exp(-float(dx * dx + dy * dy) * 0.3) * nl * nl;
-      bloom   += s * w;
-      bwt     += w;
-    }
-  }
-  if (bwt > 0.0) bloom /= bwt;
-
-  vec3 char_col = bg.rgb * mask;
-  vec3 glow_col = bloom * (1.0 - mask) * lumag * 0.7;
-  vec3 dark_tint = bg.rgb * (1.0 - mask) * 0.12;
-  gl_FragColor = vec4(char_col + glow_col + dark_tint, 1.0);
-}`;
-
-      const defaultPostShader = `precision highp float;
-uniform sampler2D u_tex;
-uniform float u_time;
-uniform float u_aspect;
-uniform vec2 u_resolution;
-uniform int u_login_state;
-uniform float u_state_time;
-varying vec2 v_uv;
-
-float hash(vec2 p) {
-  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
-}
-
-void main() {
-  vec2 uv = v_uv;
-  vec2 px = 1.0 / u_resolution;
-
-  // subtle horizontal wave
-  uv.x += sin(uv.y * 60.0 + u_time * 6.0) * 0.0008;
-
-  // chromatic aberration
-  float ca = 0.0008;
-  float r = texture2D(u_tex, uv + vec2(ca, 0.0)).r;
-  float g = texture2D(u_tex, uv).g;
-  float b = texture2D(u_tex, uv - vec2(ca, 0.0)).b;
-  vec3 col = vec3(r, g, b);
-
-  // soft bloom
-  vec3 bloom = texture2D(u_tex, uv + vec2(px.x * 2.0, 0.0)).rgb;
-  bloom    += texture2D(u_tex, uv - vec2(px.x * 2.0, 0.0)).rgb;
-  bloom    += texture2D(u_tex, uv + vec2(0.0, px.y * 2.0)).rgb;
-  bloom    += texture2D(u_tex, uv - vec2(0.0, px.y * 2.0)).rgb;
-  col += bloom * 0.055;
-
-  // scanlines
-  col *= 0.97 + 0.03 * sin(uv.y * u_resolution.y * 3.14159);
-
-  // vignette
-  vec2 c = uv - 0.5;
-  col *= 1.0 - dot(c, c) * 1.8;
-
-  // film grain
-  col += (hash(uv + fract(u_time * 0.1)) - 0.5) * 0.028;
-
-  // auth failure red flash
-  if (u_login_state == 4) {
-    float hit = exp(-u_state_time * 3.0);
-    col = mix(col, col * vec3(1.5, 0.55, 0.55), hit);
-  }
-
-  gl_FragColor = vec4(max(col, vec3(0.0)), 1.0);
-}`;
 
       const bgShader = document.getElementById("bg-shader");
       const effectShader = document.getElementById("effect-shader");
@@ -362,12 +217,13 @@ void main() {
       const editor = document.getElementById("editor");
       const toggleBtn = document.getElementById("toggle-btn");
 
-      bgShader.value = defaultBgShader;
-      effectShader.value = defaultEffectShader;
-      postShader.value = defaultPostShader;
+      bgShader.value = "";
+      effectShader.value = "";
+      postShader.value = "";
 
       for (const ta of [bgShader, effectShader, postShader]) {
         ta.addEventListener("keydown", (event) => event.stopPropagation());
+        ta.addEventListener("input", () => { presetSrc[ta.id] = null; });
       }
 
       toggleBtn.addEventListener("click", () => {
@@ -375,7 +231,7 @@ void main() {
         toggleBtn.textContent = collapsed ? "show" : "hide";
       });
 
-      let effectEnabled = true;
+      let effectEnabled = false;
 
       const effectToggle = document.getElementById("effect-toggle");
       effectToggle.addEventListener("click", () => {
@@ -388,20 +244,38 @@ void main() {
       const b64enc = (s) => btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
       const b64dec = (s) => atob(s.replace(/-/g, "+").replace(/_/g, "/"));
 
+      // tracks active preset path per textarea id; null means custom content
+      const presetSrc = { "bg-shader": null, "effect-shader": null, "post-shader": null };
+
       function encodeState() {
         const params = new URLSearchParams();
-        params.set("bg", b64enc(bgShader.value));
-        params.set("effect", b64enc(effectShader.value));
-        params.set("post", b64enc(postShader.value));
-        params.set("fx", effectEnabled ? "1" : "0");
+        const enc = (id, key, val) => {
+          if (!val.trim()) return;
+          params.set(key, presetSrc[id] ? "p:" + presetSrc[id] : b64enc(val));
+        };
+        enc("bg-shader",     "bg",     bgShader.value);
+        enc("effect-shader", "effect", effectShader.value);
+        enc("post-shader",   "post",   postShader.value);
+        if (effectEnabled) params.set("fx", "1");
         history.replaceState(null, "", "?" + params.toString());
       }
 
-      function decodeState() {
+      async function decodeState() {
         const params = new URLSearchParams(location.search);
-        if (params.has("bg")) bgShader.value = b64dec(params.get("bg"));
-        if (params.has("effect")) effectShader.value = b64dec(params.get("effect"));
-        if (params.has("post")) postShader.value = b64dec(params.get("post"));
+        const dec = async (key, el, id) => {
+          if (!params.has(key)) return;
+          const val = params.get(key);
+          if (val.startsWith("p:")) {
+            const path = val.slice(2);
+            presetSrc[id] = path;
+            el.value = await fetch(path).then((r) => r.text());
+          } else {
+            el.value = b64dec(val);
+          }
+        };
+        await dec("bg",     bgShader,     "bg-shader");
+        await dec("effect", effectShader, "effect-shader");
+        await dec("post",   postShader,   "post-shader");
         if (params.has("fx")) {
           effectEnabled = params.get("fx") === "1";
           effectToggle.textContent = effectEnabled ? "enabled" : "disabled";
@@ -409,10 +283,12 @@ void main() {
         }
       }
 
-      decodeState();
+      await decodeState();
 
       function buildConfig(bg, effect, post) {
-        const effectSection = effectEnabled
+        const bgLine     = bg.trim()   ? `shader = ${JSON.stringify(bg)}\n`   : "";
+        const postLine   = post.trim() ? `shader = ${JSON.stringify(post)}\n` : "";
+        const effectSection = effectEnabled && effect.trim()
           ? `\n[background.effect]\nshader = ${JSON.stringify(effect)}\n`
           : "";
         return `
@@ -420,11 +296,9 @@ void main() {
 font_size = 72
 
 [background]
-shader = ${JSON.stringify(bg)}
-${effectSection}
+${bgLine}${effectSection}
 [post]
-shader = ${JSON.stringify(post)}
-`;
+${postLine}`;
       }
 
       document.querySelectorAll(".preset-bar").forEach((bar) => {
@@ -434,6 +308,7 @@ shader = ${JSON.stringify(post)}
             try {
               const src = await fetch(btn.dataset.src).then((r) => r.text());
               document.getElementById(targetId).value = src;
+              presetSrc[targetId] = btn.dataset.src;
             } catch (e) {
               console.error("failed to load preset:", e);
             }

@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut display = DrmDisplay::new()?;
     let (w, h) = display.size();
-    let cfg = toomuch::Config::from_toml_file("./config.toml").unwrap_or_default();
+    let cfg = toomuch::Config::from_toml_file("/etc/toomuch/config.toml").unwrap_or_default();
 
     let scene;
     {

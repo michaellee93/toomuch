@@ -127,10 +127,15 @@ impl WebApp {
         let mut runtime = self.runtime.borrow_mut();
         runtime.scene = Scene::new(&runtime.gl, &cfg, runtime.w, runtime.h).map_err(js_err)?;
         runtime.config = cfg;
-        let tex = runtime.effect_texture.as_ref().map(|(d, w, h)| (d.clone(), *w, *h));
+        let tex = runtime
+            .effect_texture
+            .as_ref()
+            .map(|(d, w, h)| (d.clone(), *w, *h));
         if let Some((data, w, h)) = tex {
             let rt = &mut *runtime;
-            rt.scene.set_effect_texture(&rt.gl, &data, w, h).map_err(js_err)?;
+            rt.scene
+                .set_effect_texture(&rt.gl, &data, w, h)
+                .map_err(js_err)?;
         }
         Ok(())
     }
@@ -143,10 +148,15 @@ impl WebApp {
         runtime.h = h;
         let cfg = runtime.config.clone();
         runtime.scene = Scene::new(&runtime.gl, &cfg, w, h).map_err(js_err)?;
-        let tex = runtime.effect_texture.as_ref().map(|(d, w, h)| (d.clone(), *w, *h));
+        let tex = runtime
+            .effect_texture
+            .as_ref()
+            .map(|(d, w, h)| (d.clone(), *w, *h));
         if let Some((data, tw, th)) = tex {
             let rt = &mut *runtime;
-            rt.scene.set_effect_texture(&rt.gl, &data, tw, th).map_err(js_err)?;
+            rt.scene
+                .set_effect_texture(&rt.gl, &data, tw, th)
+                .map_err(js_err)?;
         }
         Ok(())
     }
@@ -155,7 +165,9 @@ impl WebApp {
         let mut runtime = self.runtime.borrow_mut();
         runtime.effect_texture = Some((data.to_vec(), width, height));
         let rt = &mut *runtime;
-        rt.scene.set_effect_texture(&rt.gl, data, width, height).map_err(js_err)
+        rt.scene
+            .set_effect_texture(&rt.gl, data, width, height)
+            .map_err(js_err)
     }
 }
 

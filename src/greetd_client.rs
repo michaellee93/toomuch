@@ -59,7 +59,7 @@ fn greetd_login(
     password: &str,
     result_tx: &mpsc::Sender<GreetdResult>,
 ) -> io::Result<()> {
-    const SESSION_CMD: &str = "/bin/bash";
+    const SESSION_CMD: &str = "/bin/zsh";
 
     send(
         stream,

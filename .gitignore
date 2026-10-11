@@ -1,0 +1,12 @@
+/target
+/web/pkg
+/pkg
+
+# local dev artefacts
+*.qcow2
+/correctbin
+/michael@localhost
+/.codex
+/errors.txt
+/outs.txt
+/capture.png

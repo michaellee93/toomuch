@@ -66,7 +66,7 @@ pub enum AuthMessageType {
 pub fn send<T: Serialize>(stream: &mut UnixStream, msg: &T) -> io::Result<()> {
     let payload = serde_json::to_vec(msg).expect("serialisation failed");
     let len = payload.len() as u32;
-    stream.write_all(&len.to_le_bytes())?;
+    stream.write_all(&len.to_ne_bytes())?;
     stream.write_all(&payload)
 }
 
@@ -74,7 +74,7 @@ pub fn send<T: Serialize>(stream: &mut UnixStream, msg: &T) -> io::Result<()> {
 pub fn recv<T: DeserializeOwned>(stream: &mut UnixStream) -> io::Result<T> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
+    let len = u32::from_ne_bytes(len_buf) as usize;
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf)?;
     serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -200,6 +200,9 @@ pub struct InputConfig {
     #[serde(rename = "type")]
     pub r#type: InputType,
     pub font_size: usize,
+    pub username_prefix: String,
+    pub password_prefix: String,
+    pub cursor: char,
 }
 
 impl Default for InputConfig {
@@ -207,6 +210,9 @@ impl Default for InputConfig {
         Self {
             r#type: InputType::Terminal,
             font_size: 72,
+            username_prefix: "Hello ".into(),
+            password_prefix: "".into(),
+            cursor: '_',
         }
     }
 }

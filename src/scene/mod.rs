@@ -1,4 +1,7 @@
-use crate::{BackgroundConfig, BackgroundEffect, Config, InputConfig, PostConfig, login::LoginView};
+use crate::{
+    BackgroundConfig, BackgroundEffect, Config, InputConfig, PostConfig,
+    login::{LoginView, LoginVisualState},
+};
 use font8x8::legacy::BASIC_LEGACY;
 use glow::{COLOR_BUFFER_BIT, HasContext};
 use std::collections::HashMap;
@@ -11,8 +14,16 @@ type GlProgram = <glow::Context as HasContext>::Program;
 type GlShader = <glow::Context as HasContext>::Shader;
 type GlTexture = <glow::Context as HasContext>::Texture;
 
+const DOT_ANIMATION_INTERVAL_SECS: f32 = 0.180;
+const DOT_ANIMATION_STEPS: u32 = 4;
+
 fn load_shader(path: &str) -> io::Result<String> {
     fs::read_to_string(path)
+}
+
+fn animated_dots(state_time: f32) -> String {
+    let step = (state_time / DOT_ANIMATION_INTERVAL_SECS).floor() as u32;
+    format!("{:<3}", ".".repeat((step % DOT_ANIMATION_STEPS) as usize))
 }
 
 fn background_effect_shader_src(effect: &BackgroundEffect) -> Result<String, io::Error> {
@@ -217,7 +228,16 @@ fn create_luminance_ramp_atlas(scale: usize) -> (Vec<u8>, u32, u32) {
     let h = cell;
     let mut rgba = vec![0u8; w * h * 4];
     for (i, &code) in ramp.iter().enumerate() {
-        draw_glyph(&mut rgba, w, h, BASIC_LEGACY[code as usize], i * cell, 0, scale, FG);
+        draw_glyph(
+            &mut rgba,
+            w,
+            h,
+            BASIC_LEGACY[code as usize],
+            i * cell,
+            0,
+            scale,
+            FG,
+        );
     }
     (rgba, w as u32, h as u32)
 }
@@ -340,7 +360,12 @@ impl BackgroundScene {
             .unwrap_or_else(|_| Self::BG_FSHAD.into())
     }
 
-    pub fn new(gl: &glow::Context, cfg: &BackgroundConfig, w: u32, h: u32) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(
+        gl: &glow::Context,
+        cfg: &BackgroundConfig,
+        w: u32,
+        h: u32,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         #[rustfmt::skip]
         let verts: [f32; 16] = [
             -1.0,  1.0,  0.0, 1.0,
@@ -479,9 +504,14 @@ pub struct TextScene {
     text_color_loc: glow::UniformLocation,
     text_translate_loc: glow::UniformLocation,
     text_time_loc: glow::UniformLocation,
+
+    // display stuff
+    username_pfx: String,
+    password_pfx: String,
+    cursor: char,
 }
 impl TextScene {
-    const TEXT_VSHAD: &str = "precision mediump float; \
+    const TEXT_VSHAD: &'static str = "precision mediump float; \
     attribute vec2 a_pos; \
     attribute vec2 a_uv; \
     attribute float a_blink; \
@@ -499,7 +529,7 @@ impl TextScene {
         v_uv = a_uv; \
     } \
 ";
-    const TEXT_FSHAD: &str = "precision mediump float; \
+    const TEXT_FSHAD: &'static str = "precision mediump float; \
     uniform sampler2D u_font; \
     uniform vec4 u_color; \
     uniform float u_time; \
@@ -585,7 +615,62 @@ impl TextScene {
                 text_color_loc,
                 text_translate_loc,
                 text_time_loc,
+                username_pfx: cfg.username_prefix.clone(),
+                password_pfx: cfg.password_prefix.clone(),
+                cursor: cfg.cursor,
             })
+        }
+    }
+
+    fn text_from_view(&self, view: &LoginView) -> String {
+        let cursor = self.cursor;
+        match view.state {
+            LoginVisualState::UsernameInput => {
+                let mut text = String::with_capacity(
+                    self.username_pfx.len() + view.username.len() + cursor.len_utf8(),
+                );
+                text.push_str(&self.username_pfx);
+                text.push_str(&view.username);
+                text.push(cursor);
+                text
+            }
+            LoginVisualState::PasswordInput => {
+                let mut text = String::with_capacity(
+                    self.username_pfx.len()
+                        + view.username.len()
+                        + 1
+                        + self.password_pfx.len()
+                        + view.password_mask.len()
+                        + cursor.len_utf8(),
+                );
+                text.push_str(&self.username_pfx);
+                text.push_str(&view.username);
+                text.push('\n');
+                text.push_str(&self.password_pfx);
+                text.push_str(&view.password_mask);
+                text.push(cursor);
+                text
+            }
+            LoginVisualState::Authenticating => {
+                format!(
+                    "{}{}\nauthenticating{}",
+                    self.username_pfx,
+                    view.username,
+                    animated_dots(view.state_time)
+                )
+            }
+            LoginVisualState::StartingSession => {
+                format!(
+                    "{}{}\nstarting session{}",
+                    self.username_pfx,
+                    view.username,
+                    animated_dots(view.state_time)
+                )
+            }
+            LoginVisualState::Failure => {
+                format!("{}{}\nlogin failed", self.username_pfx, view.username)
+            }
+            LoginVisualState::Success => String::new(),
         }
     }
 
@@ -597,10 +682,8 @@ impl TextScene {
     ) -> Result<(), Box<dyn std::error::Error>> {
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(scene_fbo));
-            //  // construct the vertices from the
-            let display_text: Vec<char> =
-                //"Welcome back cuz\nEnter your password _".chars().collect();
-                view.msg.chars().collect();
+            //  // construct the vertices from the text
+            let display_text: Vec<char> = self.text_from_view(view).chars().collect();
             let mut text_verts: Vec<f32> = Vec::with_capacity(display_text.len() * 6 * 4);
             let line_height: usize = self.scale * 8 + 20;
             let mut cursor_x = 0;
@@ -805,14 +888,36 @@ impl BackgroundFxScene {
                     let tex = gl.create_texture()?;
                     gl.bind_texture(glow::TEXTURE_2D, Some(tex));
                     gl.tex_image_2d(
-                        glow::TEXTURE_2D, 0, glow::RGBA as i32,
-                        ramp_w as i32, ramp_h as i32, 0,
-                        glow::RGBA, glow::UNSIGNED_BYTE, Some(&ramp_rgba),
+                        glow::TEXTURE_2D,
+                        0,
+                        glow::RGBA as i32,
+                        ramp_w as i32,
+                        ramp_h as i32,
+                        0,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        Some(&ramp_rgba),
                     );
-                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
-                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
-                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_MIN_FILTER,
+                        glow::NEAREST as i32,
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_MAG_FILTER,
+                        glow::NEAREST as i32,
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_WRAP_S,
+                        glow::CLAMP_TO_EDGE as i32,
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_WRAP_T,
+                        glow::CLAMP_TO_EDGE as i32,
+                    );
                     Some(tex)
                 },
                 aux_tex_loc: gl.get_uniform_location(prog, "u_aux_tex"),
@@ -854,10 +959,26 @@ impl BackgroundFxScene {
                 glow::UNSIGNED_BYTE,
                 Some(data),
             );
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_S,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_T,
+                glow::CLAMP_TO_EDGE as i32,
+            );
             self.aux_tex = Some(tex);
         }
         Ok(())
@@ -895,7 +1016,7 @@ impl BackgroundFxScene {
                 gl.uniform_1_f32(Some(time_loc), view.time);
             }
             if let Some(login_state_loc) = &self.login_state_loc {
-                gl.uniform_1_i32(Some(login_state_loc), view.state);
+                gl.uniform_1_i32(Some(login_state_loc), view.state.shader_id());
             }
             if let Some(state_time_loc) = &self.state_time_loc {
                 gl.uniform_1_f32(Some(state_time_loc), view.state_time);
@@ -1087,7 +1208,7 @@ impl PostprocScene {
                 gl.uniform_1_f32(Some(time_loc), view.time);
             }
             if let Some(login_state_loc) = &self.login_state_loc {
-                gl.uniform_1_i32(Some(login_state_loc), view.state);
+                gl.uniform_1_i32(Some(login_state_loc), view.state.shader_id());
             }
             if let Some(state_time_loc) = &self.state_time_loc {
                 gl.uniform_1_f32(Some(state_time_loc), view.state_time);

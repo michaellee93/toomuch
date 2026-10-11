@@ -6,9 +6,6 @@ type ClockInstant = std::time::Instant;
 #[cfg(target_arch = "wasm32")]
 type ClockInstant = f64;
 
-const DOT_ANIMATION_INTERVAL: Duration = Duration::from_millis(180);
-const DOT_ANIMATION_STEPS: u128 = 4;
-
 #[derive(Debug)]
 pub enum LoginState {
     UsernameInput { username: String },
@@ -17,6 +14,29 @@ pub enum LoginState {
     StartingSession { username: String },
     Failure { username: String },
     Success,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoginVisualState {
+    UsernameInput,
+    PasswordInput,
+    Authenticating,
+    StartingSession,
+    Failure,
+    Success,
+}
+
+impl LoginVisualState {
+    pub fn shader_id(self) -> i32 {
+        match self {
+            Self::UsernameInput => 0,
+            Self::PasswordInput => 1,
+            Self::Authenticating => 2,
+            Self::StartingSession => 3,
+            Self::Failure => 4,
+            Self::Success => 5,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -79,41 +99,14 @@ impl Default for LoginState {
 }
 
 impl LoginState {
-    pub fn visual_state(&self) -> i32 {
+    pub fn visual_state(&self) -> LoginVisualState {
         match self {
-            LoginState::UsernameInput { .. } => 0,
-            LoginState::PasswordInput { .. } => 1,
-            LoginState::Authenticating { .. } => 2,
-            LoginState::StartingSession { .. } => 3,
-            LoginState::Failure { .. } => 4,
-            LoginState::Success => 5,
-        }
-    }
-
-    pub fn message(&self, elapsed: Duration) -> String {
-        match self {
-            LoginState::UsernameInput { username } => format!("Hello {}_", username),
-            LoginState::PasswordInput { username, password } => format!(
-                "Hello {}\n{}_",
-                username,
-                password.chars().map(|_| '*').collect::<String>()
-            ),
-            LoginState::Authenticating { username } => {
-                format!(
-                    "Hello {}\nauthenticating{}",
-                    username,
-                    animated_dots(elapsed)
-                )
-            }
-            LoginState::StartingSession { username } => {
-                format!(
-                    "Hello {}\nstarting session{}",
-                    username,
-                    animated_dots(elapsed)
-                )
-            }
-            LoginState::Failure { username } => format!("Hello {}\nlogin failed", username),
-            LoginState::Success => String::new(),
+            LoginState::UsernameInput { .. } => LoginVisualState::UsernameInput,
+            LoginState::PasswordInput { .. } => LoginVisualState::PasswordInput,
+            LoginState::Authenticating { .. } => LoginVisualState::Authenticating,
+            LoginState::StartingSession { .. } => LoginVisualState::StartingSession,
+            LoginState::Failure { .. } => LoginVisualState::Failure,
+            LoginState::Success => LoginVisualState::Success,
         }
     }
 
@@ -197,11 +190,6 @@ impl LoginState {
     }
 }
 
-fn animated_dots(elapsed: Duration) -> String {
-    let step = elapsed.as_millis() / DOT_ANIMATION_INTERVAL.as_millis();
-    format!("{:<3}", ".".repeat((step % DOT_ANIMATION_STEPS) as usize))
-}
-
 pub struct LoginApp {
     state: LoginState,
     start: ClockInstant,
@@ -233,8 +221,20 @@ impl LoginApp {
 
     pub fn view(&self) -> LoginView {
         let state_elapsed = clock_elapsed(self.state_start);
+        let (username, password_mask) = match &self.state {
+            LoginState::UsernameInput { username }
+            | LoginState::Authenticating { username }
+            | LoginState::StartingSession { username }
+            | LoginState::Failure { username } => (username.clone(), String::new()),
+            LoginState::PasswordInput { username, password } => (
+                username.clone(),
+                password.chars().map(|_| '*').collect::<String>(),
+            ),
+            LoginState::Success => (String::new(), String::new()),
+        };
         LoginView {
-            msg: self.state.message(state_elapsed),
+            username,
+            password_mask,
             time: clock_elapsed(self.start).as_secs_f32(),
             state: self.state.visual_state(),
             state_time: state_elapsed.as_secs_f32(),
@@ -273,8 +273,9 @@ fn clock_elapsed(start: ClockInstant) -> Duration {
 }
 
 pub struct LoginView {
-    pub msg: String,
+    pub username: String,
+    pub password_mask: String,
     pub time: f32,
-    pub state: i32,
+    pub state: LoginVisualState,
     pub state_time: f32,
 }
